@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/paddock-core",
     "crates/paddock-bench",
+    "crates/paddock-server",
 ]
 # `paddock-fuzz` lives outside the default workspace member set because
 # `libfuzzer-sys` only compiles under `cfg(fuzzing)` set by `cargo-fuzz`,
@@ -57,6 +58,16 @@ io-uring = "0.7"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+
+# HTTP server (paddock-server).
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["trace", "timeout", "limit"] }
 
 # Test / bench
 proptest = "1.5"

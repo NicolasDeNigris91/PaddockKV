@@ -1,0 +1,18 @@
+# Exclude build artefacts and editor noise from the Docker context. The
+# fewer bytes Docker sends to its daemon, the faster the build.
+
+/target
+**/target/
+crates/paddock-fuzz/corpus
+crates/paddock-fuzz/artifacts
+.git
+.github
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+results/
+flamegraph*.svg
+perf.data*
+*.profraw

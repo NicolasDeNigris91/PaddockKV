@@ -78,6 +78,69 @@ let db = Db::open_with(MemVfs::new(), "/data", cfg)?;
 See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for what the
 encryption layer protects and (importantly) what it does **not**.
 
+## HTTP server
+
+A thin axum-based HTTP wrapper lives in [`crates/paddock-server`](crates/paddock-server/).
+It exposes the engine over a small JSON API and reads its configuration
+from environment variables so the same binary deploys to Railway,
+Fly.io, Render, or a bare VM with no flags:
+
+| Variable              | Default        | Meaning                                                |
+|-----------------------|----------------|--------------------------------------------------------|
+| `PORT`                | `8080`         | TCP port to bind on `0.0.0.0`                          |
+| `DATA_DIR`            | `./data`       | Engine data directory                                   |
+| `PADDOCK_MASTER_KEY`  | _(unset)_      | 64-char hex (32 bytes) → enables encryption-at-rest    |
+| `RUST_LOG`            | `info,paddock_server=debug,tower_http=info` | Tracing filter |
+
+Routes:
+
+- `GET /health` — liveness probe (always 200 OK)
+- `GET /stats` — JSON `{sstable_count, current_seqno, encrypted}`
+- `PUT /kv/:key` — body is the raw value bytes; stores `key → value`
+- `GET /kv/:key` — returns value bytes on hit, `404` on miss
+- `DELETE /kv/:key` — writes a tombstone
+- `GET /scan?start=<b64>&end=<b64>&limit=<n>` — JSON array of records, keys & values base64-encoded
+- `POST /flush` — drain pending memtables to SSTables
+- `POST /compact` — merge every SSTable into one
+
+### Run locally
+
+```bash
+cargo run --release -p paddock-server
+# server listens on 0.0.0.0:8080
+curl -X PUT --data 'world' http://127.0.0.1:8080/kv/hello
+curl http://127.0.0.1:8080/kv/hello
+# → world
+```
+
+### Deploy to Railway
+
+1. Push this repository to GitHub (already done if you are reading this on github.com).
+2. From Railway: **New Project → Deploy from GitHub repo → PaddockKV**.
+3. Railway picks up [`railway.toml`](railway.toml) and the
+   [`Dockerfile`](Dockerfile) automatically and runs a multi-stage
+   cargo-chef build.
+4. **Add a Volume**: Settings → Volumes → Add Volume, mount path `/data`.
+   Without a volume, SSTables and the WAL live only inside the container
+   and are wiped on every redeploy.
+5. *(Optional)* Enable encryption-at-rest:
+   ```bash
+   railway variables --set "PADDOCK_MASTER_KEY=$(openssl rand -hex 32)"
+   ```
+   Keep that value safe — losing it makes every previously-written
+   SSTable unreadable.
+6. Hit your `*.up.railway.app` URL:
+   ```bash
+   curl -X PUT --data 'world' https://<your-app>.up.railway.app/kv/hello
+   curl https://<your-app>.up.railway.app/kv/hello
+   ```
+
+> **Security caveat**: the demo server has no authentication. Anyone who
+> can reach the URL can read and write every key. Before exposing it to
+> the open internet, put it behind an API gateway, a sidecar that adds
+> Bearer-token auth, or wire authentication into `paddock-server`
+> directly.
+
 ## Benchmarks
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) once Phase 10 lands.

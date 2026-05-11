@@ -1,0 +1,30 @@
+# Railway service config for paddock-server.
+#
+# Builds the project via the Dockerfile at the repo root (multi-stage
+# cargo-chef cache) and exposes `paddock-server` on the port Railway
+# injects via $PORT. Mount a Railway volume at /data so SSTables and the
+# WAL survive container restarts.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "/usr/local/bin/paddock-server"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# Railway's HTTP healthcheck. Polls /health every 30 s; failures over
+# the threshold trigger a restart.
+healthcheckPath = "/health"
+healthcheckTimeout = 5
+
+# Required environment variables for the deployment (override in the
+# Railway UI or via CLI):
+#
+#   PORT                 Railway injects this automatically; do not set.
+#   DATA_DIR             Defaults to /data (matches the Dockerfile volume).
+#   PADDOCK_MASTER_KEY   Optional. 64-char hex → enables AES-256-GCM
+#                        encryption-at-rest. Set via:
+#                          railway variables --set PADDOCK_MASTER_KEY=$(openssl rand -hex 32)
+#   RUST_LOG             Defaults to info,paddock_server=debug,tower_http=info
