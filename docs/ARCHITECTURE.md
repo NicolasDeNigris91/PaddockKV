@@ -61,7 +61,7 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 3 | Memtable (arena + Pugh skip list) | ✅ done |
 | 4 | SSTable read path (format, block, writer, reader) | ✅ done |
 | 5 | Bloom filters (blocked, AVX2 SIMD, SSTable-integrated) | ✅ done |
-| 6 | Read path end-to-end | ⏳ |
+| 6 | Engine integration (`Db::open/put/get/flush/close`, recovery) | ✅ done |
 | 7 | Compaction + manifest | ⏳ |
 | 8 | Encryption at rest | ⏳ |
 | 9 | Fuzzing + sanitizers | ⏳ |

@@ -34,6 +34,25 @@ cargo build --release
 cargo test --workspace
 ```
 
+## API preview
+
+```rust
+use paddock_core::{Db, io::vfs::MemVfs};
+
+let vfs = MemVfs::new();              // production path uses a Linux VFS
+let db = Db::open(vfs, "/data")?;
+
+db.put(b"hello", b"world")?;
+assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
+
+let snap = db.snapshot();
+db.put(b"hello", b"there")?;
+assert_eq!(db.get_at(b"hello", snap)?, Some(b"world".to_vec()));  // MVCC
+
+db.flush()?;                           // drain memtable → SSTable
+let reopened = Db::open(vfs, "/data")?; // WAL replay restores in-memory state
+```
+
 ## Benchmarks
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) once Phase 10 lands.

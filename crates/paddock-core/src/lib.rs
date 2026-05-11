@@ -19,6 +19,7 @@
 
 pub mod checksum;
 pub mod encoding;
+pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod io;
@@ -26,4 +27,5 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 
+pub use engine::{Db, DbConfig, Snapshot};
 pub use error::{Error, Result};
