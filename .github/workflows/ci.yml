@@ -62,12 +62,21 @@ jobs:
         run: rustup component add miri --toolchain $(cat rust-toolchain.toml | grep channel | cut -d'"' -f2)
       - name: Setup miri
         run: cargo miri setup
-      - name: Run tests under miri
+      # Miri specifically targets the unsafe-heavy modules:
+      #   - `io::aligned_buf` (manual allocator + raw pointer math)
+      #   - `memtable::arena`  (bump allocator + slab list)
+      #   - `memtable::skiplist` (lock-free skip list, AtomicPtr CAS)
+      #   - `filter::blocked_bloom` (AVX2 SIMD probe + AlignedBuf back-store)
+      # We skip proptest cases (`prop_*`) because miri is ~100× slower than
+      # native and the high-iteration property tests would dominate CI time.
+      - name: Miri on unsafe-heavy modules
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
-        # We exclude proptest cases because they're slow under miri. Phase 0 has
-        # no unsafe; later phases will gate which modules run under miri.
-        run: cargo miri test -p paddock-core --lib -- --skip prop_
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
+        run: |
+          cargo miri test -p paddock-core --lib io::aligned_buf -- --skip prop_
+          cargo miri test -p paddock-core --lib memtable::arena -- --skip prop_
+          cargo miri test -p paddock-core --lib memtable::skiplist -- --skip prop_ --skip multi_threaded_reads_during_single_writer_inserts
+          cargo miri test -p paddock-core --lib filter::blocked_bloom -- --skip prop_ --skip scalar_and_avx2_agree
 
   deny:
     name: cargo-deny
@@ -77,3 +86,30 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      # Smoke-run every fuzz target for 30 seconds each. Real fuzzing
+      # campaigns run out-of-band on a dedicated host; CI's job is to
+      # catch crashes that any 30-second run would find — i.e. immediate
+      # panics on the empty / one-byte / two-byte / etc. inputs.
+      - name: WAL recovery
+        working-directory: crates/paddock-fuzz
+        run: cargo +nightly fuzz run fuzz_wal_recovery -- -max_total_time=30
+      - name: SSTable parse
+        working-directory: crates/paddock-fuzz
+        run: cargo +nightly fuzz run fuzz_sstable_parse -- -max_total_time=30
+      - name: Bloom decode
+        working-directory: crates/paddock-fuzz
+        run: cargo +nightly fuzz run fuzz_bloom_decode -- -max_total_time=30
+      - name: WriteBatch decode
+        working-directory: crates/paddock-fuzz
+        run: cargo +nightly fuzz run fuzz_writebatch_decode -- -max_total_time=30

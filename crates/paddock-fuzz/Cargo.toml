@@ -1,0 +1,54 @@
+[package]
+name = "paddock-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.95"
+
+[package.metadata]
+cargo-fuzz = true
+
+# `cargo-fuzz` sets `--cfg fuzzing` when building targets; plain
+# `cargo build` does not, and Rust 1.95 warns about unknown cfgs. Declare
+# the cfg up-front so both build modes stay quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[dependencies]
+libfuzzer-sys = "0.4"
+paddock-core = { path = "../paddock-core" }
+
+[lib]
+path = "src/lib.rs"
+
+# A separate Cargo manifest at fuzz/fuzz_targets/Cargo.toml is the
+# convention `cargo-fuzz` uses; we keep this crate as the lib that
+# fuzz-targets pull in.
+
+[[bin]]
+name = "fuzz_wal_recovery"
+path = "fuzz_targets/wal_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sstable_parse"
+path = "fuzz_targets/sstable_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bloom_decode"
+path = "fuzz_targets/bloom_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_writebatch_decode"
+path = "fuzz_targets/writebatch_decode.rs"
+test = false
+doc = false
+bench = false

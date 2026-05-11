@@ -1,4 +1,5 @@
 /target
+**/target/
 **/*.rs.bk
 Cargo.lock.bak
 *.swp
@@ -16,6 +17,7 @@ perf.data*
 .vscode/
 *.iml
 
-# Fuzz corpora are large
+# Fuzz corpora and artifacts are large.
 /crates/paddock-fuzz/corpus
 /crates/paddock-fuzz/artifacts
+/crates/paddock-fuzz/Cargo.lock

@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "bloom"
 harness = false
+
+[[bench]]
+name = "engine"
+harness = false

@@ -4,6 +4,12 @@ members = [
     "crates/paddock-core",
     "crates/paddock-bench",
 ]
+# `paddock-fuzz` lives outside the default workspace member set because
+# `libfuzzer-sys` only compiles under `cfg(fuzzing)` set by `cargo-fuzz`,
+# and pulling it into routine `cargo build --workspace` would force every
+# developer to install libFuzzer (Linux-only). We still keep the manifest
+# inside the repo so `cargo +nightly fuzz run ...` from
+# `crates/paddock-fuzz/` "just works".
 exclude = [
     "crates/paddock-fuzz",
 ]
