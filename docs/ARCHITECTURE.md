@@ -59,7 +59,7 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 1 | I/O foundation (mmap, O_DIRECT, io_uring) | ✅ done |
 | 2 | WAL (format, batch, writer, reader, replay) | ✅ done |
 | 3 | Memtable (arena + Pugh skip list) | ✅ done |
-| 4 | SSTable read path | ⏳ |
+| 4 | SSTable read path (format, block, writer, reader) | ✅ done |
 | 5 | Bloom filters | ⏳ |
 | 6 | Read path end-to-end | ⏳ |
 | 7 | Compaction + manifest | ⏳ |
