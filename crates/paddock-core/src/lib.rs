@@ -18,6 +18,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod checksum;
+pub mod crypto;
 pub mod encoding;
 pub mod engine;
 pub mod error;

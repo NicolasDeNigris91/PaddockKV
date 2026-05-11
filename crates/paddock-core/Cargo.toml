@@ -19,6 +19,10 @@ crossbeam-epoch = { workspace = true }
 crossbeam-channel = { workspace = true }
 arc-swap = { workspace = true }
 zerocopy = { workspace = true }
+# Crypto (Phase 8 — encryption at rest).
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
