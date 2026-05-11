@@ -13,10 +13,13 @@
 //! by [`SstReader::get`] point directly into the page cache; for now reads
 //! are buffered (`read_at` into a heap buffer).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use zerocopy::FromBytes;
 
 use crate::checksum::Algorithm;
 use crate::error::{Error, Result};
+use crate::filter::BlockedBloom;
 use crate::io::vfs::VfsFile;
 use crate::sstable::block::{BlockReader, RecordView};
 use crate::sstable::format::{BLOCK_HANDLE_SIZE, BlockHandle, FOOTER_SIZE, Footer, RecordOp};
@@ -26,6 +29,11 @@ pub struct SstReader<F: VfsFile> {
     file: F,
     footer: Footer,
     index_bytes: Vec<u8>,
+    bloom: Option<BlockedBloom>,
+    /// Per-table counter for filter pruning hits. Used for diagnostics and
+    /// can drive automatic dynamic tuning later. `Relaxed` because this is
+    /// purely observability — losing an increment under contention is fine.
+    bloom_misses_pruned: AtomicU64,
 }
 
 impl<F: VfsFile> std::fmt::Debug for SstReader<F> {
@@ -36,6 +44,11 @@ impl<F: VfsFile> std::fmt::Debug for SstReader<F> {
             .field("index_offset", &idx_off)
             .field("index_len", &idx_len)
             .field("index_bytes_loaded", &self.index_bytes.len())
+            .field("has_bloom", &self.bloom.is_some())
+            .field(
+                "bloom_pruned",
+                &self.bloom_misses_pruned.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -79,10 +92,26 @@ impl<F: VfsFile> SstReader<F> {
         let mut index_bytes = vec![0u8; idx_len];
         file.read_at(&mut index_bytes, idx_off)?;
 
+        // Load the filter block if one is present. A zero-length handle
+        // indicates the SSTable was written without a Bloom filter.
+        let bloom = {
+            let filter_off = footer.filter_handle.offset.get();
+            let filter_len = footer.filter_handle.length.get() as usize;
+            if filter_len == 0 {
+                None
+            } else {
+                let mut filter_bytes = vec![0u8; filter_len];
+                file.read_at(&mut filter_bytes, filter_off)?;
+                Some(BlockedBloom::decode(&filter_bytes)?)
+            }
+        };
+
         Ok(Self {
             file,
             footer,
             index_bytes,
+            bloom,
+            bloom_misses_pruned: AtomicU64::new(0),
         })
     }
 
@@ -97,6 +126,15 @@ impl<F: VfsFile> SstReader<F> {
     /// `None`. (Tombstones surface as hits with `op = Tombstone`; the engine
     /// layer above interprets them.)
     pub fn get(&self, key: &[u8], snapshot: u64) -> Result<Option<LookupHit>> {
+        // Step 0 — consult the Bloom filter. A `false` answer is a
+        // definitive miss; we skip the data-block read entirely.
+        if let Some(bloom) = &self.bloom
+            && !bloom.contains(key)
+        {
+            self.bloom_misses_pruned.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+
         // Step 1 — find the data block whose last_key is >= target by
         // seeking inside the index block.
         let Some(handle) = self.locate_block(key)? else {
@@ -153,6 +191,21 @@ impl<F: VfsFile> SstReader<F> {
         Algorithm::Crc32c
     }
 
+    /// `true` if this SSTable carries a Bloom filter the reader can consult
+    /// for pruning negative lookups.
+    #[must_use]
+    pub const fn has_bloom_filter(&self) -> bool {
+        self.bloom.is_some()
+    }
+
+    /// Number of point lookups that the Bloom filter rejected without
+    /// touching the data blocks. Exposed for engine-level telemetry; the
+    /// counter monotonically increases over the reader's lifetime.
+    #[must_use]
+    pub fn bloom_pruned_count(&self) -> u64 {
+        self.bloom_misses_pruned.load(Ordering::Relaxed)
+    }
+
     fn locate_block(&self, key: &[u8]) -> Result<Option<BlockHandle>> {
         let reader = BlockReader::open(&self.index_bytes)?;
         let Some(rec) = reader.seek(key) else {
@@ -196,6 +249,7 @@ fn decode_block_handle(bytes: &[u8]) -> Result<BlockHandle> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss, reason = "test fixtures use small values")]
 mod tests {
     use super::*;
     use crate::io::vfs::{MemVfs, Vfs};
@@ -289,6 +343,38 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn bloom_filter_prunes_negative_lookups() {
+        // Build a small table; query 1000 keys that are NOT in it.
+        // The Bloom filter should prune the vast majority (target ~99%)
+        // before any data block read happens.
+        let vfs = MemVfs::new();
+        let file = vfs.open_writable("sst").unwrap();
+        let mut w = SstWriter::create(file, Algorithm::Crc32c).unwrap();
+        for i in 0..200u32 {
+            let k = format!("present-{i:05}");
+            w.add(k.as_bytes(), b"v", u64::from(i + 1), RecordOp::Put)
+                .unwrap();
+        }
+        let _ = w.finish().unwrap();
+
+        let r = SstReader::open(vfs.open_readonly("sst").unwrap()).unwrap();
+        assert!(r.has_bloom_filter());
+
+        let probes = 1_000u64;
+        for i in 0..probes {
+            let k = format!("absent-{i:06}");
+            let res = r.get(k.as_bytes(), u64::MAX).unwrap();
+            assert!(res.is_none());
+        }
+        let pruned = r.bloom_pruned_count();
+        let prune_rate = pruned as f64 / probes as f64;
+        assert!(
+            prune_rate > 0.90,
+            "filter prune rate too low: {pruned}/{probes} = {prune_rate}"
+        );
     }
 
     #[test]

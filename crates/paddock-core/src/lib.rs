@@ -20,6 +20,7 @@
 pub mod checksum;
 pub mod encoding;
 pub mod error;
+pub mod filter;
 pub mod io;
 pub mod memtable;
 pub mod sstable;

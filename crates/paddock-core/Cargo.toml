@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "varint"
 harness = false
+
+[[bench]]
+name = "bloom"
+harness = false

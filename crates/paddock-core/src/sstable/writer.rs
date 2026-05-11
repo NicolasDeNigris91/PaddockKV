@@ -31,6 +31,7 @@ use zerocopy::IntoBytes;
 
 use crate::checksum::Algorithm;
 use crate::error::Result;
+use crate::filter::{BlockedBloom, BloomParams};
 use crate::io::vfs::VfsFile;
 use crate::sstable::block::BlockBuilder;
 use crate::sstable::format::{
@@ -57,17 +58,42 @@ pub struct SstWriter<F: VfsFile> {
     max_seqno: u64,
     checksum_alg: Algorithm,
     block_size: usize,
+    /// Bloom filter being populated as keys arrive. Sized eagerly on
+    /// construction (`new_with_filter_capacity`); the default `create`
+    /// sizes it for 10K keys and re-sizes lazily if it overshoots.
+    bloom: Option<BlockedBloom>,
 }
 
 impl<F: VfsFile> SstWriter<F> {
     /// Construct a new writer over `file`. Pads out the reserved header
     /// region immediately so subsequent appends produce the data-blocks
     /// region at offset [`FILE_HEADER_REGION_SIZE`].
-    pub fn create(mut file: F, checksum_alg: Algorithm) -> Result<Self> {
+    pub fn create(file: F, checksum_alg: Algorithm) -> Result<Self> {
+        Self::create_with_filter_capacity(file, checksum_alg, 10_000, BloomParams::default())
+    }
+
+    /// Construct a writer with an explicit Bloom-filter capacity hint.
+    ///
+    /// The filter is sized for `expected_keys` entries; insertions beyond
+    /// that bound still work (the FPR creeps up gracefully) so a sloppy
+    /// hint never causes a hard failure. Pass `0` to omit the filter
+    /// entirely — useful when the engine knows it will never lookup into
+    /// this table (e.g. a write-only sink).
+    pub fn create_with_filter_capacity(
+        mut file: F,
+        checksum_alg: Algorithm,
+        expected_keys: usize,
+        params: BloomParams,
+    ) -> Result<Self> {
         // Reserve the file-header region with zeros. We'll back-fill the real
         // header inside [`finish`].
         let pad = vec![0u8; FILE_HEADER_REGION_SIZE];
         file.append(&pad)?;
+        let bloom = if expected_keys == 0 {
+            None
+        } else {
+            Some(BlockedBloom::new(expected_keys, params))
+        };
         Ok(Self {
             file,
             data_builder: BlockBuilder::new(),
@@ -80,6 +106,7 @@ impl<F: VfsFile> SstWriter<F> {
             max_seqno: 0,
             checksum_alg,
             block_size: DEFAULT_BLOCK_SIZE,
+            bloom,
         })
     }
 
@@ -106,6 +133,11 @@ impl<F: VfsFile> SstWriter<F> {
             key
         );
         self.data_builder.add(key, value, seqno, op);
+        // Feed the filter on every record so the reader can short-circuit
+        // negative point lookups.
+        if let Some(bloom) = self.bloom.as_mut() {
+            bloom.insert(key);
+        }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.num_entries += 1;
@@ -183,11 +215,26 @@ impl<F: VfsFile> SstWriter<F> {
         self.flush_block()?;
         let data_blocks_end_offset = self.bytes_written;
 
-        // Filter block — empty placeholder for Phase 4.
-        let filter_handle = BlockHandle {
-            offset: zerocopy::little_endian::U64::new(self.bytes_written),
-            length: zerocopy::little_endian::U32::new(0),
-            checksum: zerocopy::little_endian::U32::new(0),
+        // Filter block: persist the Bloom filter we accumulated as keys
+        // arrived. Zero-length handle when filter is disabled.
+        let filter_handle = if let Some(bloom) = self.bloom.take() {
+            let bytes = bloom.encode();
+            let offset = self.bytes_written;
+            self.file.append(&bytes)?;
+            self.bytes_written += bytes.len() as u64;
+            BlockHandle {
+                offset: zerocopy::little_endian::U64::new(offset),
+                length: zerocopy::little_endian::U32::new(
+                    u32::try_from(bytes.len()).expect("filter block fits in u32"),
+                ),
+                checksum: zerocopy::little_endian::U32::new(0),
+            }
+        } else {
+            BlockHandle {
+                offset: zerocopy::little_endian::U64::new(self.bytes_written),
+                length: zerocopy::little_endian::U32::new(0),
+                checksum: zerocopy::little_endian::U32::new(0),
+            }
         };
 
         // Meta block — empty placeholder.
@@ -273,10 +320,16 @@ mod tests {
     use zerocopy::FromBytes;
 
     #[test]
-    fn empty_writer_produces_only_header_filter_meta_index_footer() {
+    fn empty_writer_with_filter_disabled_has_only_layout_overhead() {
         let vfs = MemVfs::new();
         let file = vfs.open_writable("sst").unwrap();
-        let w = SstWriter::create(file, Algorithm::Crc32c).unwrap();
+        let w = SstWriter::create_with_filter_capacity(
+            file,
+            Algorithm::Crc32c,
+            0, // no Bloom filter
+            BloomParams::default(),
+        )
+        .unwrap();
         let _ = w.finish().unwrap();
 
         let f = vfs.open_readonly("sst").unwrap();

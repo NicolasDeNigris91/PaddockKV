@@ -60,7 +60,7 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 2 | WAL (format, batch, writer, reader, replay) | ✅ done |
 | 3 | Memtable (arena + Pugh skip list) | ✅ done |
 | 4 | SSTable read path (format, block, writer, reader) | ✅ done |
-| 5 | Bloom filters | ⏳ |
+| 5 | Bloom filters (blocked, AVX2 SIMD, SSTable-integrated) | ✅ done |
 | 6 | Read path end-to-end | ⏳ |
 | 7 | Compaction + manifest | ⏳ |
 | 8 | Encryption at rest | ⏳ |
