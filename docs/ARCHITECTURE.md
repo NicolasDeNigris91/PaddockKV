@@ -57,7 +57,7 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 |---|---|---|
 | 0 | Foundations (errors, varint, checksums, CI) | ✅ done |
 | 1 | I/O foundation (mmap, O_DIRECT, io_uring) | ✅ done |
-| 2 | WAL | ⏳ |
+| 2 | WAL (format, batch, writer, reader, replay) | ✅ done |
 | 3 | Memtable | ⏳ |
 | 4 | SSTable read path | ⏳ |
 | 5 | Bloom filters | ⏳ |

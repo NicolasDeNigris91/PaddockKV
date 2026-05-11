@@ -21,5 +21,6 @@ pub mod checksum;
 pub mod encoding;
 pub mod error;
 pub mod io;
+pub mod wal;
 
 pub use error::{Error, Result};
