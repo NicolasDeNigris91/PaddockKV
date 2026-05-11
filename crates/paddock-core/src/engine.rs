@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 
 use crate::checksum::Algorithm;
+use crate::compaction::compact::{CompactionConfig, compact_sstables};
 use crate::error::Result;
 use crate::filter::BloomParams;
 use crate::io::vfs::Vfs;
@@ -109,6 +110,33 @@ impl Snapshot {
     }
 }
 
+/// One live SSTable: its file id (so the engine can unlink the file after
+/// compaction) plus the open reader.
+pub struct LiveSst<F: crate::io::vfs::VfsFile> {
+    /// File id (the `NNNNNNNN` in `NNNNNNNN.sst`).
+    pub id: u64,
+    /// Open reader.
+    pub reader: Arc<SstReader<F>>,
+}
+
+impl<F: crate::io::vfs::VfsFile> Clone for LiveSst<F> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            reader: Arc::clone(&self.reader),
+        }
+    }
+}
+
+impl<F: crate::io::vfs::VfsFile> std::fmt::Debug for LiveSst<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveSst")
+            .field("id", &self.id)
+            .field("has_bloom", &self.reader.has_bloom_filter())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Engine state pointed-to by [`Db::state`]. Every read captures one of
 /// these via `Arc<EngineState<V>>` and walks the four collections inside.
 pub struct EngineState<V: Vfs> {
@@ -120,7 +148,7 @@ pub struct EngineState<V: Vfs> {
     /// Currently-live SSTables. Newest first (the first match wins on
     /// duplicate keys, so the freshest version always shadows older
     /// flushes).
-    pub sstables: Vec<Arc<SstReader<<V as Vfs>::File>>>,
+    pub sstables: Vec<LiveSst<<V as Vfs>::File>>,
 }
 
 impl<V: Vfs> std::fmt::Debug for EngineState<V> {
@@ -191,13 +219,16 @@ impl<V: Vfs> Db<V> {
         // Build the initial state. SSTables present on disk are opened and
         // registered newest-first. Memtable is empty until WAL replay
         // populates it.
-        let mut sstables: Vec<Arc<SstReader<V::File>>> = Vec::new();
+        let mut sstables: Vec<LiveSst<V::File>> = Vec::new();
         let mut sst_sorted = sst_files;
         sst_sorted.sort_unstable_by(|a, b| b.cmp(a)); // newest first
         for n in sst_sorted {
             let path = sst_path(&dir, n);
             let file = vfs.open_readonly(&path)?;
-            sstables.push(Arc::new(SstReader::open(file)?));
+            sstables.push(LiveSst {
+                id: n,
+                reader: Arc::new(SstReader::open(file)?),
+            });
         }
 
         let memtable = Arc::new(SkipList::new());
@@ -311,7 +342,7 @@ impl<V: Vfs> Db<V> {
 
         // 3. SSTables (newest first).
         for sst in &state.sstables {
-            if let Some(hit) = sst.get(key, snapshot.seqno)? {
+            if let Some(hit) = sst.reader.get(key, snapshot.seqno)? {
                 return Ok(match hit.op {
                     RecordOp::Put => Some(hit.value),
                     RecordOp::Tombstone => None,
@@ -356,6 +387,89 @@ impl<V: Vfs> Db<V> {
     /// Clean shutdown. Flushes any pending memtables to SSTables.
     pub fn close(self) -> Result<()> {
         self.flush()
+    }
+
+    /// Merge **every currently-live SSTable** into a single new SSTable,
+    /// atomically swap the engine state to reference the new file, and
+    /// unlink the inputs from the VFS.
+    ///
+    /// Reads remain serviceable for the entire operation: an in-flight
+    /// `get` running against the pre-compaction state continues to walk
+    /// the old SSTables until it drops its `Arc<EngineState>`; the next
+    /// `get` after the swap walks the post-compaction state with one
+    /// fewer level of indirection.
+    ///
+    /// Phase 7 keeps every `(key, seqno)` pair the inputs carry — read
+    /// amplification drops, space amplification does not. See
+    /// [`crate::compaction`] for the rationale.
+    pub fn compact_all(&self) -> Result<()> {
+        let state = self.state.load_full();
+        if state.sstables.len() < 2 {
+            // Nothing to merge.
+            return Ok(());
+        }
+        // Snapshot the inputs (id + Arc). Cloning a `LiveSst` is cheap —
+        // the underlying reader is shared via `Arc`.
+        let inputs: Vec<LiveSst<V::File>> = state.sstables.clone();
+        drop(state);
+
+        // Reserve a fresh file number under the write lock.
+        let output_id = {
+            let mut ctx = self.write_lock.lock().expect("write_lock poisoned");
+            let n = ctx.next_file_number;
+            ctx.next_file_number += 1;
+            n
+        };
+        let output_path = sst_path(&self.data_dir, output_id);
+
+        let input_readers: Vec<Arc<SstReader<V::File>>> =
+            inputs.iter().map(|l| Arc::clone(&l.reader)).collect();
+
+        let output = compact_sstables(
+            &self.vfs,
+            &input_readers,
+            &output_path,
+            &CompactionConfig {
+                bloom: self.config.bloom_params(),
+                bloom_capacity_floor: self.config.sstable_capacity_hint,
+                checksum: Algorithm::Crc32c,
+            },
+        )?;
+
+        // Swap: remove every input SSTable from EngineState by id, insert
+        // the merged output at the head.
+        let new_state = {
+            let prev = self.state.load_full();
+            let input_ids: std::collections::HashSet<u64> = inputs.iter().map(|l| l.id).collect();
+            let mut sstables: Vec<LiveSst<V::File>> =
+                Vec::with_capacity(prev.sstables.len() - inputs.len() + 1);
+            sstables.push(LiveSst {
+                id: output_id,
+                reader: output.reader,
+            });
+            for sst in &prev.sstables {
+                if !input_ids.contains(&sst.id) {
+                    sstables.push(sst.clone());
+                }
+            }
+            Arc::new(EngineState::<V> {
+                active_memtable: Arc::clone(&prev.active_memtable),
+                immutable_memtables: prev.immutable_memtables.clone(),
+                sstables,
+            })
+        };
+        self.state.store(new_state);
+
+        // Inputs are unreachable from the new state. Best-effort cleanup
+        // of the on-disk files. We swallow `remove` errors because a
+        // missing file is fine (idempotent) and the engine state is
+        // already correct regardless.
+        for input in inputs {
+            let path = sst_path(&self.data_dir, input.id);
+            let _ = self.vfs.remove(&path);
+        }
+
+        Ok(())
     }
 
     /// Engine-internal accessors used by tests / telemetry.
@@ -480,7 +594,10 @@ impl<V: Vfs> Db<V> {
         let new_state = {
             let prev = self.state.load_full();
             let mut sstables = Vec::with_capacity(prev.sstables.len() + 1);
-            sstables.push(Arc::new(reader));
+            sstables.push(LiveSst {
+                id: file_number,
+                reader: Arc::new(reader),
+            });
             sstables.extend(prev.sstables.iter().cloned());
             // Drop the just-flushed memtable from the immutable queue.
             // We match by Arc identity to be robust to multiple concurrent

@@ -13,6 +13,7 @@
 //! by [`SstReader::get`] point directly into the page cache; for now reads
 //! are buffered (`read_at` into a heap buffer).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerocopy::FromBytes;
@@ -183,6 +184,23 @@ impl<F: VfsFile> SstReader<F> {
         Ok(out)
     }
 
+    /// Streaming, block-by-block scan of every record in ascending order.
+    ///
+    /// Unlike [`scan`](Self::scan), the streaming form never materialises
+    /// the whole table in RAM — each record is yielded as soon as it is
+    /// decoded, and only the current data block is held in memory. This is
+    /// the iterator the compaction layer pulls from when merging multiple
+    /// SSTables.
+    pub fn scan_stream(self: &Arc<Self>) -> Result<SstStream<F>> {
+        let handles = decode_index_handles(&self.index_bytes)?;
+        Ok(SstStream {
+            reader: Arc::clone(self),
+            handles,
+            next_block: 0,
+            current: Vec::new().into_iter(),
+        })
+    }
+
     /// Algorithm tag stored on disk for block checksums (informational).
     #[must_use]
     pub const fn checksum_algorithm(&self) -> Algorithm {
@@ -246,6 +264,85 @@ fn decode_block_handle(bytes: &[u8]) -> Result<BlockHandle> {
     let handle = BlockHandle::ref_from_bytes(&bytes[..BLOCK_HANDLE_SIZE])
         .map_err(|_| Error::invalid_format_static("sstable index value", "size mismatch"))?;
     Ok(*handle)
+}
+
+fn decode_index_handles(index_bytes: &[u8]) -> Result<Vec<BlockHandle>> {
+    let reader = BlockReader::open(index_bytes)?;
+    let mut out = Vec::new();
+    for rec in &reader {
+        out.push(decode_block_handle(rec.value)?);
+    }
+    Ok(out)
+}
+
+/// Streaming iterator over every record in an SSTable.
+///
+/// Yielded by [`SstReader::scan_stream`]; lives at most one data block at
+/// a time in memory. Records come back in `(key ascending, seqno
+/// descending)` order — the same convention the memtable and the
+/// compaction merger use.
+pub struct SstStream<F: VfsFile> {
+    reader: Arc<SstReader<F>>,
+    handles: Vec<BlockHandle>,
+    next_block: usize,
+    current: std::vec::IntoIter<(Vec<u8>, LookupHit)>,
+}
+
+impl<F: VfsFile> SstStream<F> {
+    fn refill(&mut self) -> Result<bool> {
+        while self.next_block < self.handles.len() {
+            let h = self.handles[self.next_block];
+            self.next_block += 1;
+            let block_off = h.offset.get();
+            let block_len = h.length.get() as usize;
+            let mut block_bytes = vec![0u8; block_len];
+            self.reader.file.read_at(&mut block_bytes, block_off)?;
+            let data_reader = BlockReader::open(&block_bytes)?;
+            let mut records = Vec::with_capacity(64);
+            for rec in &data_reader {
+                records.push((rec.key.clone(), into_hit(&rec)));
+            }
+            if records.is_empty() {
+                continue;
+            }
+            self.current = records.into_iter();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Pull the next record, or `Ok(None)` at the end of the stream.
+    pub fn next_record(&mut self) -> Result<Option<(Vec<u8>, LookupHit)>> {
+        loop {
+            if let Some(rec) = self.current.next() {
+                return Ok(Some(rec));
+            }
+            if !self.refill()? {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+impl<F: VfsFile> Iterator for SstStream<F> {
+    type Item = Result<(Vec<u8>, LookupHit)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_record() {
+            Ok(Some(rec)) => Some(Ok(rec)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+impl<F: VfsFile> std::fmt::Debug for SstStream<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstStream")
+            .field("blocks_total", &self.handles.len())
+            .field("blocks_remaining", &(self.handles.len() - self.next_block))
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

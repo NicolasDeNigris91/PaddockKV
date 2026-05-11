@@ -42,5 +42,5 @@ pub mod format;
 pub mod reader;
 pub mod writer;
 
-pub use reader::SstReader;
+pub use reader::{LookupHit, SstReader, SstStream};
 pub use writer::SstWriter;

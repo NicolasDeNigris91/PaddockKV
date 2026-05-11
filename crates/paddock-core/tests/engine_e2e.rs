@@ -124,6 +124,95 @@ fn missing_keys_report_none() {
 }
 
 #[test]
+fn compact_all_reduces_sstable_count_to_one() {
+    let (_vfs, db) = open();
+    for chunk in 0..5u32 {
+        for i in 0..40u32 {
+            let k = format!("k-{chunk}-{i:03}");
+            db.put(k.as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(db.sstable_count(), 5);
+    db.compact_all().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    // Every record still resolves.
+    for chunk in 0..5u32 {
+        for i in 0..40u32 {
+            let k = format!("k-{chunk}-{i:03}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+}
+
+#[test]
+fn compact_all_preserves_newest_value_on_duplicate_keys() {
+    let (_vfs, db) = open();
+    db.put(b"k", b"v0").unwrap();
+    db.flush().unwrap();
+    db.put(b"k", b"v1").unwrap();
+    db.flush().unwrap();
+    db.put(b"k", b"v2").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.sstable_count(), 3);
+    db.compact_all().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn compact_all_preserves_tombstones() {
+    let (_vfs, db) = open();
+    db.put(b"alive", b"v").unwrap();
+    db.put(b"dead", b"v").unwrap();
+    db.flush().unwrap();
+    db.delete(b"dead").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.sstable_count(), 2);
+    db.compact_all().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    assert_eq!(db.get(b"alive").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"dead").unwrap(), None);
+}
+
+#[test]
+fn compact_all_is_a_noop_when_only_one_sstable_exists() {
+    let (_vfs, db) = open();
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    db.compact_all().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn compact_all_survives_subsequent_reopen() {
+    let vfs = MemVfs::new();
+    {
+        let db = Db::open(vfs.clone(), "/db").unwrap();
+        for round in 0..4u32 {
+            for i in 0..50u32 {
+                db.put(format!("k-{round}-{i:03}").as_bytes(), b"v")
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+        db.compact_all().unwrap();
+        assert_eq!(db.sstable_count(), 1);
+    }
+    // Reopen.
+    let db = Db::open(vfs, "/db").unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    for round in 0..4u32 {
+        for i in 0..50u32 {
+            let k = format!("k-{round}-{i:03}");
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
+        }
+    }
+}
+
+#[test]
 fn tombstones_survive_through_multiple_flush_rounds() {
     let (_vfs, db) = open();
     for i in 0..30u32 {

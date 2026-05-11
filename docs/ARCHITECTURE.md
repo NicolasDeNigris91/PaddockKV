@@ -62,7 +62,8 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 4 | SSTable read path (format, block, writer, reader) | ✅ done |
 | 5 | Bloom filters (blocked, AVX2 SIMD, SSTable-integrated) | ✅ done |
 | 6 | Engine integration (`Db::open/put/get/flush/close`, recovery) | ✅ done |
-| 7 | Compaction + manifest | ⏳ |
+| 7 | Compaction (k-way merge, `Db::compact_all`) | ✅ done |
+| 7b | Snapshot-aware version pruning + manifest | ⏳ |
 | 8a | Crypto primitives (AES-256-GCM, HKDF-SHA256, envelope) | ✅ done |
 | 8b | SSTable encryption pipeline integration | ⏳ |
 | 9 | Fuzzing + sanitizers | ⏳ |
