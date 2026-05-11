@@ -1,0 +1,37 @@
+[package]
+name = "paddock-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Linux-native LSM-tree key-value store engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+crc32c = { workspace = true }
+xxhash-rust = { workspace = true }
+crossbeam-epoch = { workspace = true }
+crossbeam-channel = { workspace = true }
+arc-swap = { workspace = true }
+zerocopy = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+io-uring = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "checksum"
+harness = false
+
+[[bench]]
+name = "varint"
+harness = false

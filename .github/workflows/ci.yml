@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toolchain
+        run: rustup show
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install toolchain
+        run: rustup show
+      - name: Run tests (debug)
+        run: cargo test --workspace --all-features
+      - name: Run tests (release)
+        run: cargo test --workspace --all-features --release
+      - name: Build benchmarks (no run)
+        run: cargo bench --workspace --no-run
+
+  miri:
+    name: miri (unsafe verification)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install miri
+        run: rustup component add miri --toolchain $(cat rust-toolchain.toml | grep channel | cut -d'"' -f2)
+      - name: Setup miri
+        run: cargo miri setup
+      - name: Run tests under miri
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
+        # We exclude proptest cases because they're slow under miri. Phase 0 has
+        # no unsafe; later phases will gate which modules run under miri.
+        run: cargo miri test -p paddock-core --lib -- --skip prop_
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

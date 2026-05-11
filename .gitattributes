@@ -1,0 +1,20 @@
+# Enforce LF line endings on every text file. Rustfmt and clippy run in CI
+# on Linux runners; mixing CRLF on Windows working copies and LF on CI would
+# noise up diffs and produce phantom rustfmt failures.
+
+* text=auto eol=lf
+
+# Lock specific text formats.
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.sh        text eol=lf
+Cargo.lock  text eol=lf
+
+# Binary lock.
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.svg       binary

@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+*.swp
+*.swo
+.DS_Store
+
+# Benchmark output
+/results
+/flamegraph*.svg
+perf.data*
+*.profraw
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Fuzz corpora are large
+/crates/paddock-fuzz/corpus
+/crates/paddock-fuzz/artifacts

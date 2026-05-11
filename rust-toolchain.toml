@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.95.0"
+# Note: `miri` is intentionally omitted here because it is unavailable on
+# x86_64-pc-windows-msvc. CI installs it explicitly on the Linux miri job.
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"
