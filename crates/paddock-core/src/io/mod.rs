@@ -36,6 +36,11 @@ pub mod vfs;
 #[cfg(target_os = "linux")]
 pub mod direct;
 #[cfg(target_os = "linux")]
+pub mod linux_vfs;
+#[cfg(target_os = "linux")]
 pub mod mmap;
 #[cfg(target_os = "linux")]
 pub mod uring;
+
+#[cfg(target_os = "linux")]
+pub use linux_vfs::{LinuxFile, LinuxVfs};

@@ -68,7 +68,9 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 8b | SSTable encryption pipeline (per-block AEAD, file-header back-fill, WAL post-flush cleanup) | ✅ done |
 | 9 | Fuzz harness (4 targets) + Miri CI on unsafe-heavy modules | ✅ done |
 | 10 | End-to-end engine criterion benchmarks + published numbers | ✅ done |
-| 11 | Production Linux VFS (`O_DIRECT` + io_uring + mmap), vs-RocksDB benches | ⏳ |
+| 11a | Production `LinuxVfs` (`std::fs` + `pread`/`pwrite`/`fdatasync`) | ✅ done |
+| 11b | `Db::range` / `Db::scan_all` ordered iterator (k-way merge, MVCC-aware) | ✅ done |
+| 11c | High-throughput Linux paths (`O_DIRECT` + io_uring), vs-RocksDB benches | ⏳ |
 | 9 | Fuzzing + sanitizers | ⏳ |
 | 10 | Benchmarks + docs | ⏳ |
 

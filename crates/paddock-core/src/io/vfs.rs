@@ -48,7 +48,11 @@ pub trait Vfs: Send + Sync {
 
 /// File handle behaviour expected by engine code. Implementations are free to
 /// add inherent methods on top (e.g. `O_DIRECT`-specific aligned reads).
-pub trait VfsFile: Send {
+///
+/// `Send + Sync + 'static` lets the engine ship file handles into
+/// background threads (Phase 11 flush/compaction workers) and into
+/// streaming iterators that need a thread-safe `Arc<File>` underneath.
+pub trait VfsFile: Send + Sync + 'static {
     /// Append `data` to the file. Returns the offset at which the write
     /// landed.
     fn append(&mut self, data: &[u8]) -> Result<u64>;

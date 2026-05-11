@@ -39,7 +39,9 @@ cargo test --workspace
 ```rust
 use paddock_core::{Db, io::vfs::MemVfs};
 
-let vfs = MemVfs::new();              // production path uses a Linux VFS
+// In tests / scripts:  MemVfs.
+// On Linux production:  paddock_core::io::LinuxVfs::create_at("/var/lib/paddock")?
+let vfs = MemVfs::new();
 let db = Db::open(vfs, "/data")?;
 
 db.put(b"hello", b"world")?;
@@ -49,9 +51,32 @@ let snap = db.snapshot();
 db.put(b"hello", b"there")?;
 assert_eq!(db.get_at(b"hello", snap)?, Some(b"world".to_vec()));  // MVCC
 
-db.flush()?;                           // drain memtable → SSTable
-let reopened = Db::open(vfs, "/data")?; // WAL replay restores in-memory state
+// Ordered range scan over an arbitrary slice of the keyspace.
+for rec in db.range(b"a", b"z")? {
+    let rec = rec?;
+    println!("{:?} -> {:?}", rec.key, rec.value);
+}
+
+db.flush()?;                            // drain memtable → encrypted SSTable
+db.compact_all()?;                      // k-way-merge several SSTables → one
 ```
+
+## Encryption at rest
+
+```rust
+use paddock_core::{Db, crypto::MasterKey, engine::DbConfig, io::vfs::MemVfs};
+
+let cfg = DbConfig {
+    master_key: Some(MasterKey::from_bytes([0u8; 32])), // load from KMS
+    ..DbConfig::default()
+};
+let db = Db::open_with(MemVfs::new(), "/data", cfg)?;
+// Every SSTable the engine emits is AES-256-GCM-encrypted under a
+// per-table key derived via HKDF-SHA256 from the master key.
+```
+
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for what the
+encryption layer protects and (importantly) what it does **not**.
 
 ## Benchmarks
 

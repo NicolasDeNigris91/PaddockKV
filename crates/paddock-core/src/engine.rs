@@ -47,13 +47,14 @@ use arc_swap::ArcSwap;
 
 use crate::checksum::Algorithm;
 use crate::compaction::compact::{CompactionConfig, compact_sstables};
+use crate::compaction::merger::KWayMerge;
 use crate::crypto::kdf::{MasterKey, derive_sstable_key};
 use crate::error::Result;
 use crate::filter::BloomParams;
 use crate::io::vfs::Vfs;
 use crate::memtable::{OpType, SkipList};
 use crate::sstable::format::RecordOp;
-use crate::sstable::reader::SstReader;
+use crate::sstable::reader::{LookupHit, SstReader};
 use crate::sstable::writer::SstWriter;
 use crate::wal::batch::{Op, WriteBatch};
 use crate::wal::reader::SegmentReader;
@@ -395,6 +396,46 @@ impl<V: Vfs> Db<V> {
         }
 
         Ok(None)
+    }
+
+    /// Iterate every live record whose key lies in `[start, end_exclusive)`,
+    /// in ascending key order, snapshotted at the engine's current
+    /// sequence number.
+    ///
+    /// The iterator merges the active memtable, every immutable memtable,
+    /// and every live SSTable through a [`KWayMerge`]; for each unique
+    /// user key it returns at most one record — the freshest version
+    /// whose seqno is `<= snapshot`. Tombstones suppress the key entirely
+    /// (they never appear in the output).
+    pub fn range(&self, start: &[u8], end_exclusive: &[u8]) -> Result<DbRangeIter<V>> {
+        self.range_bounds(
+            std::ops::Bound::Included(start),
+            std::ops::Bound::Excluded(end_exclusive),
+            self.snapshot(),
+        )
+    }
+
+    /// General-purpose ordered range scan with explicit bounds. Both
+    /// endpoints accept `Bound::{Included, Excluded, Unbounded}`. Use
+    /// `Bound::Unbounded` on both sides for a full-table scan, including
+    /// keys longer than any explicit sentinel.
+    pub fn range_bounds(
+        &self,
+        start: std::ops::Bound<&[u8]>,
+        end: std::ops::Bound<&[u8]>,
+        snapshot: Snapshot,
+    ) -> Result<DbRangeIter<V>> {
+        DbRangeIter::new(self.state.load_full(), start, end, snapshot)
+    }
+
+    /// Full-table scan in ascending key order, snapshotted at the
+    /// engine's current sequence number.
+    pub fn scan_all(&self) -> Result<DbRangeIter<V>> {
+        self.range_bounds(
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            self.snapshot(),
+        )
     }
 
     /// Force the engine to drain every pending memtable to disk. After this
@@ -753,6 +794,239 @@ fn apply_batch_to_memtable(memtable: &SkipList, seqno: u64, batch: &WriteBatch) 
             }
         }
     }
+}
+
+// ----- range scan -----
+
+/// Ordered iterator over a [`Db`] within a half-open key range.
+///
+/// Constructed via [`Db::range`] / [`Db::range_bounds`] / [`Db::scan_all`].
+/// Holds an `Arc<EngineState<V>>` for the lifetime of the iterator, so an
+/// in-flight scan sees a consistent view even if writers swap state.
+pub struct DbRangeIter<V: Vfs> {
+    /// Pinned engine state. Reads see this view for the iterator's life.
+    _state: Arc<EngineState<V>>,
+    /// Upper bound.
+    end: std::ops::Bound<Vec<u8>>,
+    /// Caller's snapshot sequence number.
+    snapshot: u64,
+    /// Merger across every source (active memtable + each immutable +
+    /// each SSTable), positioned to the lower bound.
+    merger: KWayMerge<BoxedRecordStream>,
+    /// Last user key we emitted. Used to dedup consecutive same-key
+    /// records that the merger emits in (seqno desc) order.
+    last_emitted_key: Option<Vec<u8>>,
+}
+
+impl<V: Vfs> std::fmt::Debug for DbRangeIter<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbRangeIter")
+            .field("snapshot", &self.snapshot)
+            .field("inputs", &self.merger.input_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One record yielded by [`DbRangeIter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeRecord {
+    /// User key.
+    pub key: Vec<u8>,
+    /// Value bytes.
+    pub value: Vec<u8>,
+    /// Sequence number under which this record was committed.
+    pub seqno: u64,
+}
+
+/// Boxed trait object so all source iterators (memtable nodes vs.
+/// SSTable streams) live in the same `Vec` inside the merger.
+type BoxedRecordStream = Box<dyn Iterator<Item = Result<(Vec<u8>, LookupHit)>> + Send>;
+
+impl<V: Vfs> DbRangeIter<V> {
+    fn new(
+        state: Arc<EngineState<V>>,
+        start: std::ops::Bound<&[u8]>,
+        end: std::ops::Bound<&[u8]>,
+        snapshot: Snapshot,
+    ) -> Result<Self> {
+        let lower_bound: std::ops::Bound<Vec<u8>> = match start {
+            std::ops::Bound::Included(b) => std::ops::Bound::Included(b.to_vec()),
+            std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.to_vec()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        };
+        let upper_bound: std::ops::Bound<Vec<u8>> = match end {
+            std::ops::Bound::Included(b) => std::ops::Bound::Included(b.to_vec()),
+            std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.to_vec()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        };
+
+        let mut sources: Vec<BoxedRecordStream> = Vec::new();
+
+        sources.push(Box::new(memtable_source(
+            &state.active_memtable,
+            &lower_bound,
+            &upper_bound,
+        )));
+
+        for im in &state.immutable_memtables {
+            sources.push(Box::new(memtable_source(
+                &im.memtable,
+                &lower_bound,
+                &upper_bound,
+            )));
+        }
+
+        for sst in &state.sstables {
+            let stream = sst.reader.scan_stream()?;
+            sources.push(Box::new(sstable_source(
+                stream,
+                lower_bound.clone(),
+                upper_bound.clone(),
+            )));
+        }
+
+        let merger = KWayMerge::new(sources);
+
+        Ok(Self {
+            _state: state,
+            end: upper_bound,
+            snapshot: snapshot.seqno(),
+            merger,
+            last_emitted_key: None,
+        })
+    }
+
+    /// Convenience: collect every record into a `Vec`. Tests use this;
+    /// callers with large ranges should iterate instead.
+    pub fn collect_records(self) -> Result<Vec<RangeRecord>> {
+        let mut out = Vec::new();
+        for rec in self {
+            out.push(rec?);
+        }
+        Ok(out)
+    }
+
+    fn end_excludes(&self, key: &[u8]) -> bool {
+        match &self.end {
+            std::ops::Bound::Included(end) => key > end.as_slice(),
+            std::ops::Bound::Excluded(end) => key >= end.as_slice(),
+            std::ops::Bound::Unbounded => false,
+        }
+    }
+}
+
+impl<V: Vfs> Iterator for DbRangeIter<V> {
+    type Item = Result<RangeRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let merged = match self.merger.next_record() {
+                Ok(Some(rec)) => rec,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            let (key, hit) = merged;
+            // Range upper-bound check (merger is in ascending key order,
+            // so once we cross the end we are done).
+            if self.end_excludes(&key) {
+                return None;
+            }
+            // Snapshot filter.
+            if hit.seqno > self.snapshot {
+                continue;
+            }
+            // Dedup by user key: the merger emits same-key records in
+            // (seqno desc) order, so the first occurrence is the
+            // freshest visible version.
+            if let Some(prev) = &self.last_emitted_key
+                && prev.as_slice() == key.as_slice()
+            {
+                continue;
+            }
+            self.last_emitted_key = Some(key.clone());
+            match hit.op {
+                RecordOp::Tombstone => {}
+                RecordOp::Put => {
+                    return Some(Ok(RangeRecord {
+                        key,
+                        value: hit.value,
+                        seqno: hit.seqno,
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// Materialise an in-range view of a memtable as a streaming iterator of
+/// `(key, hit)` pairs. Memtables are bounded by the flush threshold
+/// (4 MiB default), so collecting the in-range slice up-front keeps the
+/// API simple and the cost bounded.
+///
+/// The returned iterator is `'static`: every byte it carries lives in
+/// the materialised `items` vector, so callers can move it into a
+/// `Box<dyn Iterator + Send + 'static>` without borrow-check pain.
+fn memtable_source(
+    memtable: &Arc<SkipList>,
+    start: &std::ops::Bound<Vec<u8>>,
+    end: &std::ops::Bound<Vec<u8>>,
+) -> std::vec::IntoIter<Result<(Vec<u8>, LookupHit)>> {
+    let mut items: Vec<Result<(Vec<u8>, LookupHit)>> = Vec::new();
+    for node in memtable.iter() {
+        let key = node.key();
+        match start {
+            std::ops::Bound::Included(b) if key < b.as_slice() => continue,
+            std::ops::Bound::Excluded(b) if key <= b.as_slice() => continue,
+            _ => {}
+        }
+        match end {
+            std::ops::Bound::Included(b) if key > b.as_slice() => break,
+            std::ops::Bound::Excluded(b) if key >= b.as_slice() => break,
+            _ => {}
+        }
+        items.push(Ok((
+            key.to_vec(),
+            LookupHit {
+                seqno: node.seqno(),
+                op: match node.op_type() {
+                    OpType::Put => RecordOp::Put,
+                    OpType::Tombstone => RecordOp::Tombstone,
+                },
+                value: node.value().to_vec(),
+            },
+        )));
+    }
+    items.into_iter()
+}
+
+/// Wrap an SSTable stream so it only yields records within the requested
+/// range. Skips the prefix below `start` lazily; ends the stream once
+/// `end` is crossed.
+fn sstable_source<F>(
+    stream: crate::sstable::reader::SstStream<F>,
+    start: std::ops::Bound<Vec<u8>>,
+    end: std::ops::Bound<Vec<u8>>,
+) -> impl Iterator<Item = Result<(Vec<u8>, LookupHit)>> + Send + 'static
+where
+    F: crate::io::vfs::VfsFile,
+{
+    stream
+        .skip_while(move |rec| match rec {
+            Ok((k, _)) => match &start {
+                std::ops::Bound::Included(b) => k.as_slice() < b.as_slice(),
+                std::ops::Bound::Excluded(b) => k.as_slice() <= b.as_slice(),
+                std::ops::Bound::Unbounded => false,
+            },
+            Err(_) => false,
+        })
+        .take_while(move |rec| match rec {
+            Ok((k, _)) => match &end {
+                std::ops::Bound::Included(b) => k.as_slice() <= b.as_slice(),
+                std::ops::Bound::Excluded(b) => k.as_slice() < b.as_slice(),
+                std::ops::Bound::Unbounded => true,
+            },
+            Err(_) => true, // surface the error to the merger
+        })
 }
 
 fn wal_segment_path(dir: &str, id: u64) -> String {
