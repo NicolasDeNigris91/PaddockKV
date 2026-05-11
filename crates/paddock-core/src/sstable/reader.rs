@@ -19,15 +19,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use zerocopy::FromBytes;
 
 use crate::checksum::Algorithm;
+use crate::crypto::aead::{Aead, AeadKey, TAG_LEN};
+use crate::crypto::envelope::{block_aad, derive_block_nonce};
 use crate::error::{Error, Result};
 use crate::filter::BlockedBloom;
 use crate::io::vfs::VfsFile;
 use crate::sstable::block::{BlockReader, RecordView};
-use crate::sstable::format::{BLOCK_HANDLE_SIZE, BlockHandle, FOOTER_SIZE, Footer, RecordOp};
+use crate::sstable::format::{
+    BLOCK_HANDLE_SIZE, BlockHandle, FILE_HEADER_SIZE, FOOTER_SIZE, FileHeader, Footer, RecordOp,
+    flag,
+};
+
+/// Per-SSTable decryption state. Stored when the file header carries the
+/// `ENCRYPTED` flag.
+pub(crate) struct DecryptionCtx {
+    pub(crate) aead: Aead,
+    pub(crate) sstable_id: u64,
+}
+
+impl std::fmt::Debug for DecryptionCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptionCtx")
+            .field("sstable_id", &self.sstable_id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// SSTable reader.
 pub struct SstReader<F: VfsFile> {
     file: F,
+    header: FileHeader,
     footer: Footer,
     index_bytes: Vec<u8>,
     bloom: Option<BlockedBloom>,
@@ -35,17 +56,21 @@ pub struct SstReader<F: VfsFile> {
     /// can drive automatic dynamic tuning later. `Relaxed` because this is
     /// purely observability — losing an increment under contention is fine.
     bloom_misses_pruned: AtomicU64,
+    crypto: Option<DecryptionCtx>,
 }
 
 impl<F: VfsFile> std::fmt::Debug for SstReader<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let idx_off = self.footer.index_handle.offset.get();
         let idx_len = self.footer.index_handle.length.get();
+        let num_entries = self.header.num_entries.get();
         f.debug_struct("SstReader")
+            .field("num_entries", &num_entries)
             .field("index_offset", &idx_off)
             .field("index_len", &idx_len)
             .field("index_bytes_loaded", &self.index_bytes.len())
             .field("has_bloom", &self.bloom.is_some())
+            .field("encrypted", &self.crypto.is_some())
             .field(
                 "bloom_pruned",
                 &self.bloom_misses_pruned.load(Ordering::Relaxed),
@@ -66,17 +91,46 @@ pub struct LookupHit {
 }
 
 impl<F: VfsFile> SstReader<F> {
-    /// Open `file`, validate the footer, and load the index block into
-    /// memory. The data blocks themselves stay on disk and are loaded on
-    /// demand during point lookups.
+    /// Open a plaintext `file`, validate the footer + canonical file
+    /// header, and load the index block into memory. The data blocks
+    /// themselves stay on disk and are loaded on demand during point
+    /// lookups.
+    ///
+    /// Fails with [`Error::InvalidFormat`] if the file's header advertises
+    /// encryption — callers must use [`open_encrypted`](Self::open_encrypted)
+    /// for those tables.
     pub fn open(file: F) -> Result<Self> {
+        Self::open_inner(file, None)
+    }
+
+    /// Open an **encrypted** `file`. The caller-supplied `aead_key` is the
+    /// per-SSTable subkey derived from the engine's master key (see
+    /// [`crate::crypto::kdf::derive_sstable_key`]). `sstable_id` must
+    /// match the value the writer passed at construction, so the AAD that
+    /// authenticates each block matches.
+    ///
+    /// Fails if the file's header does NOT advertise encryption — refusing
+    /// to silently treat a plaintext file as encrypted (or vice versa) is
+    /// part of the threat-model contract.
+    pub fn open_encrypted(file: F, aead_key: &AeadKey, sstable_id: u64) -> Result<Self> {
+        let ctx = DecryptionCtx {
+            aead: Aead::new(aead_key),
+            sstable_id,
+        };
+        Self::open_inner(file, Some(ctx))
+    }
+
+    fn open_inner(file: F, crypto: Option<DecryptionCtx>) -> Result<Self> {
         let size = file.size()?;
-        if size < FOOTER_SIZE as u64 {
+        if size < (FILE_HEADER_SIZE as u64) + (FOOTER_SIZE as u64) {
             return Err(Error::invalid_format_static(
                 "sstable",
-                "file smaller than footer",
+                "file smaller than header + footer",
             ));
         }
+
+        // Footer first — it carries the offsets we need to find the
+        // index / filter / meta blocks.
         let mut footer_bytes = [0u8; FOOTER_SIZE];
         file.read_at(&mut footer_bytes, size - FOOTER_SIZE as u64)?;
         let footer = *Footer::ref_from_bytes(&footer_bytes)
@@ -87,14 +141,48 @@ impl<F: VfsFile> SstReader<F> {
                 reason: "checksum / magic mismatch".to_owned(),
             });
         }
-        // Load the index block.
+
+        // Now the canonical file header (back-filled at offset 0).
+        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+        file.read_at(&mut header_bytes, 0)?;
+        let header = *FileHeader::ref_from_bytes(&header_bytes)
+            .map_err(|_| Error::invalid_format_static("sstable file header", "size mismatch"))?;
+        if !header.is_valid() {
+            return Err(Error::Corruption {
+                context: "sstable file header",
+                reason: "magic / version / reserved / checksum mismatch".to_owned(),
+            });
+        }
+
+        // Cross-check the encryption flag with the caller's intent. We
+        // refuse to silently bridge the gap in either direction.
+        let file_is_encrypted = header.flags.get() & flag::ENCRYPTED != 0;
+        match (file_is_encrypted, crypto.is_some()) {
+            (true, false) => {
+                return Err(Error::InvalidFormat {
+                    context: "sstable",
+                    reason: "file is encrypted; open via SstReader::open_encrypted".to_owned(),
+                });
+            }
+            (false, true) => {
+                return Err(Error::InvalidFormat {
+                    context: "sstable",
+                    reason: "file is not encrypted; open via SstReader::open".to_owned(),
+                });
+            }
+            _ => {}
+        }
+
+        // Load the index block (always plaintext — only data blocks are
+        // encrypted in this format).
         let idx_off = footer.index_handle.offset.get();
         let idx_len = footer.index_handle.length.get() as usize;
         let mut index_bytes = vec![0u8; idx_len];
         file.read_at(&mut index_bytes, idx_off)?;
 
-        // Load the filter block if one is present. A zero-length handle
-        // indicates the SSTable was written without a Bloom filter.
+        // Load the filter block if present. The filter is plaintext too —
+        // it leaks only the set of key hashes, which is metadata we
+        // explicitly do not promise to hide (see `docs/THREAT_MODEL.md`).
         let bloom = {
             let filter_off = footer.filter_handle.offset.get();
             let filter_len = footer.filter_handle.length.get() as usize;
@@ -109,11 +197,41 @@ impl<F: VfsFile> SstReader<F> {
 
         Ok(Self {
             file,
+            header,
             footer,
             index_bytes,
             bloom,
             bloom_misses_pruned: AtomicU64::new(0),
+            crypto,
         })
+    }
+
+    /// Read a data block at the given handle, transparently decrypting if
+    /// the SSTable is encrypted. Returns the plaintext block bytes that
+    /// [`BlockReader::open`] expects.
+    fn read_data_block(&self, handle: BlockHandle) -> Result<Vec<u8>> {
+        let block_off = handle.offset.get();
+        let block_len = handle.length.get() as usize;
+        let mut on_disk = vec![0u8; block_len];
+        self.file.read_at(&mut on_disk, block_off)?;
+        if let Some(ctx) = &self.crypto {
+            // AEAD seal/open is symmetric: the writer derived
+            // `derive_block_nonce(block_off)` and AAD = (sstable_id, block_off);
+            // we reproduce both here.
+            let nonce = derive_block_nonce(block_off);
+            let aad = block_aad(ctx.sstable_id, block_off);
+            let plaintext = ctx
+                .aead
+                .open(nonce.as_nonce(), &aad, &on_disk)
+                .map_err(|_| Error::Corruption {
+                    context: "sstable data block",
+                    reason: "AEAD authentication failed (corruption or wrong key)".to_owned(),
+                })?;
+            debug_assert_eq!(plaintext.len() + TAG_LEN, on_disk.len());
+            Ok(plaintext)
+        } else {
+            Ok(on_disk)
+        }
     }
 
     /// Borrow the footer for diagnostics.
@@ -142,11 +260,8 @@ impl<F: VfsFile> SstReader<F> {
             return Ok(None);
         };
 
-        // Step 2 — read the data block from disk.
-        let block_off = handle.offset.get();
-        let block_len = handle.length.get() as usize;
-        let mut block_bytes = vec![0u8; block_len];
-        self.file.read_at(&mut block_bytes, block_off)?;
+        // Step 2 — read the data block from disk (decrypting if needed).
+        let block_bytes = self.read_data_block(handle)?;
 
         // Step 3 — seek inside the block.
         let reader = BlockReader::open(&block_bytes)?;
@@ -172,10 +287,7 @@ impl<F: VfsFile> SstReader<F> {
         let index_reader = BlockReader::open(&self.index_bytes)?;
         for index_rec in &index_reader {
             let handle = decode_block_handle(index_rec.value)?;
-            let block_off = handle.offset.get();
-            let block_len = handle.length.get() as usize;
-            let mut block_bytes = vec![0u8; block_len];
-            self.file.read_at(&mut block_bytes, block_off)?;
+            let block_bytes = self.read_data_block(handle)?;
             let data_reader = BlockReader::open(&block_bytes)?;
             for rec in &data_reader {
                 out.push((rec.key.clone(), into_hit(&rec)));
@@ -214,6 +326,20 @@ impl<F: VfsFile> SstReader<F> {
     #[must_use]
     pub const fn has_bloom_filter(&self) -> bool {
         self.bloom.is_some()
+    }
+
+    /// `true` if data blocks in this SSTable are AES-256-GCM encrypted.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.crypto.is_some()
+    }
+
+    /// Borrow the canonical file header (back-filled at offset 0 by the
+    /// writer's `finish()`). Useful for diagnostics — engine code does not
+    /// usually need this.
+    #[must_use]
+    pub const fn file_header(&self) -> &FileHeader {
+        &self.header
     }
 
     /// Number of point lookups that the Bloom filter rejected without
@@ -293,10 +419,7 @@ impl<F: VfsFile> SstStream<F> {
         while self.next_block < self.handles.len() {
             let h = self.handles[self.next_block];
             self.next_block += 1;
-            let block_off = h.offset.get();
-            let block_len = h.length.get() as usize;
-            let mut block_bytes = vec![0u8; block_len];
-            self.reader.file.read_at(&mut block_bytes, block_off)?;
+            let block_bytes = self.reader.read_data_block(h)?;
             let data_reader = BlockReader::open(&block_bytes)?;
             let mut records = Vec::with_capacity(64);
             for rec in &data_reader {

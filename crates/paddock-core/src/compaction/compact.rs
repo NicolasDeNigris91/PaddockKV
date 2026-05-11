@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::checksum::Algorithm;
 use crate::compaction::merger::KWayMerge;
+use crate::crypto::aead::AeadKey;
 use crate::error::Result;
 use crate::filter::BloomParams;
 use crate::io::vfs::Vfs;
@@ -16,8 +17,8 @@ use crate::sstable::reader::SstStream;
 use crate::sstable::{SstReader, SstWriter};
 
 /// Tunables for one invocation of [`compact_sstables`].
-#[derive(Debug, Clone, Copy)]
-pub struct CompactionConfig {
+#[derive(Debug)]
+pub struct CompactionConfig<'a> {
     /// Bloom parameters for the output SSTable.
     pub bloom: BloomParams,
     /// Output SSTable's Bloom filter capacity hint. The compactor picks
@@ -26,14 +27,20 @@ pub struct CompactionConfig {
     pub bloom_capacity_floor: usize,
     /// Output SSTable's block-checksum algorithm.
     pub checksum: Algorithm,
+    /// When `Some`, the merged output is encrypted with this per-SSTable
+    /// AEAD key (typically derived from the engine's master key + the new
+    /// SSTable's file id). The supplied `output_sstable_id` is bound into
+    /// every block's AAD.
+    pub encryption: Option<(&'a AeadKey, u64)>,
 }
 
-impl Default for CompactionConfig {
+impl Default for CompactionConfig<'_> {
     fn default() -> Self {
         Self {
             bloom: BloomParams::default(),
             bloom_capacity_floor: 1024,
             checksum: Algorithm::Crc32c,
+            encryption: None,
         }
     }
 }
@@ -49,7 +56,7 @@ pub fn compact_sstables<V: Vfs>(
     vfs: &V,
     inputs: &[Arc<SstReader<V::File>>],
     output_path: &str,
-    config: &CompactionConfig,
+    config: &CompactionConfig<'_>,
 ) -> Result<CompactionOutput<V>> {
     // Stream every input.
     let mut streams: Vec<SstStream<V::File>> = Vec::with_capacity(inputs.len());
@@ -66,12 +73,22 @@ pub fn compact_sstables<V: Vfs>(
         .max(estimate_total_entries::<V>(inputs));
 
     let writer_file = vfs.open_writable(output_path)?;
-    let mut writer = SstWriter::create_with_filter_capacity(
-        writer_file,
-        config.checksum,
-        bloom_capacity,
-        config.bloom,
-    )?;
+    let mut writer = match config.encryption {
+        Some((key, sst_id)) => SstWriter::create_encrypted(
+            writer_file,
+            config.checksum,
+            bloom_capacity,
+            config.bloom,
+            key,
+            sst_id,
+        )?,
+        None => SstWriter::create_with_filter_capacity(
+            writer_file,
+            config.checksum,
+            bloom_capacity,
+            config.bloom,
+        )?,
+    };
 
     let mut merger = KWayMerge::new(streams);
     let mut emitted: u64 = 0;
@@ -81,8 +98,14 @@ pub fn compact_sstables<V: Vfs>(
     }
     let _file = writer.finish()?;
 
-    // Re-open the produced SSTable for the read side.
-    let reader = SstReader::open(vfs.open_readonly(output_path)?)?;
+    // Re-open the produced SSTable for the read side, matching whatever
+    // encryption mode the writer used.
+    let reader = match config.encryption {
+        Some((key, sst_id)) => {
+            SstReader::open_encrypted(vfs.open_readonly(output_path)?, key, sst_id)?
+        }
+        None => SstReader::open(vfs.open_readonly(output_path)?)?,
+    };
 
     Ok(CompactionOutput {
         reader: Arc::new(reader),

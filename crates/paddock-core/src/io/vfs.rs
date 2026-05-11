@@ -53,6 +53,14 @@ pub trait VfsFile: Send {
     /// landed.
     fn append(&mut self, data: &[u8]) -> Result<u64>;
 
+    /// Overwrite the bytes at `[offset, offset + data.len())` in place.
+    /// The range must already lie within the file: this method never
+    /// extends the file. Use [`append`](Self::append) for that.
+    ///
+    /// Production implementations map this onto `pwrite(2)`; the test
+    /// `MemFile` mutates its backing `Vec<u8>` directly.
+    fn write_at(&mut self, data: &[u8], offset: u64) -> Result<()>;
+
     /// Fsync the underlying file data + metadata. Production implementations
     /// should prefer `fdatasync` and expose that as a separate inherent
     /// method; this trait method is the safe default for tests.
@@ -173,6 +181,31 @@ impl VfsFile for MemFile {
         bytes.extend_from_slice(data);
         drop(bytes);
         Ok(offset)
+    }
+
+    fn write_at(&mut self, data: &[u8], offset: u64) -> Result<()> {
+        let off = usize::try_from(offset).map_err(|_| {
+            crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MemFile: offset overflow",
+            ))
+        })?;
+        let end = off.checked_add(data.len()).ok_or_else(|| {
+            crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MemFile: offset + length overflow",
+            ))
+        })?;
+        let mut bytes = self.bytes.lock().expect("MemFile lock poisoned");
+        if end > bytes.len() {
+            return Err(crate::error::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MemFile::write_at: range extends past file end",
+            )));
+        }
+        bytes[off..end].copy_from_slice(data);
+        drop(bytes);
+        Ok(())
     }
 
     fn sync(&mut self) -> Result<()> {

@@ -47,6 +47,7 @@ use arc_swap::ArcSwap;
 
 use crate::checksum::Algorithm;
 use crate::compaction::compact::{CompactionConfig, compact_sstables};
+use crate::crypto::kdf::{MasterKey, derive_sstable_key};
 use crate::error::Result;
 use crate::filter::BloomParams;
 use crate::io::vfs::Vfs;
@@ -60,7 +61,7 @@ use crate::wal::writer::SegmentWriter;
 use std::sync::Arc;
 
 /// User-tunable knobs. Pass to [`Db::open_with`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DbConfig {
     /// Memtable size in bytes that triggers rotation (active → immutable
     /// queue) and a fresh WAL segment.
@@ -72,6 +73,17 @@ pub struct DbConfig {
     /// Hint for the expected SSTable record count, used to size the Bloom
     /// filter eagerly. Overshooting is fine — only the FPR drifts.
     pub sstable_capacity_hint: usize,
+    /// Optional master key for encryption-at-rest. When `Some`, every
+    /// SSTable written by the engine is AES-256-GCM-encrypted under a
+    /// per-table key derived via
+    /// [`crate::crypto::kdf::derive_sstable_key`]. When `None`, SSTables
+    /// are plaintext.
+    ///
+    /// Compaction inherits the key transparently: the merged output is
+    /// encrypted iff the master key is set (the inputs' encryption flags
+    /// must match what the reader expects, which the engine enforces at
+    /// open time).
+    pub master_key: Option<MasterKey>,
 }
 
 impl Default for DbConfig {
@@ -81,6 +93,7 @@ impl Default for DbConfig {
             bloom_bits_per_key: 10,
             bloom_num_hashes: 8,
             sstable_capacity_hint: 10_000,
+            master_key: None,
         }
     }
 }
@@ -137,6 +150,30 @@ impl<F: crate::io::vfs::VfsFile> std::fmt::Debug for LiveSst<F> {
     }
 }
 
+/// An immutable memtable plus the id of the WAL segment that fed it.
+///
+/// The engine deletes that WAL segment once the memtable lands as an
+/// SSTable — the on-disk state would otherwise double-replay every
+/// flushed record on the next `Db::open`.
+#[derive(Clone)]
+pub struct ImmutableMemtable {
+    /// The frozen memtable.
+    pub memtable: Arc<SkipList>,
+    /// WAL segment id whose records hydrated this memtable. `0` means
+    /// "unknown / no segment to drop" — used for in-memory test setups
+    /// that bypass the WAL.
+    pub wal_segment_id: u64,
+}
+
+impl std::fmt::Debug for ImmutableMemtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImmutableMemtable")
+            .field("len", &self.memtable.len())
+            .field("wal_segment_id", &self.wal_segment_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Engine state pointed-to by [`Db::state`]. Every read captures one of
 /// these via `Arc<EngineState<V>>` and walks the four collections inside.
 pub struct EngineState<V: Vfs> {
@@ -144,7 +181,7 @@ pub struct EngineState<V: Vfs> {
     /// through `Arc`.
     pub active_memtable: Arc<SkipList>,
     /// Frozen memtables waiting to be flushed. Newest first.
-    pub immutable_memtables: Vec<Arc<SkipList>>,
+    pub immutable_memtables: Vec<ImmutableMemtable>,
     /// Currently-live SSTables. Newest first (the first match wins on
     /// duplicate keys, so the freshest version always shadows older
     /// flushes).
@@ -222,20 +259,27 @@ impl<V: Vfs> Db<V> {
         let mut sstables: Vec<LiveSst<V::File>> = Vec::new();
         let mut sst_sorted = sst_files;
         sst_sorted.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+        // Track the maximum sequence number seen across both SSTables and
+        // WAL so the engine resumes from the right place. Deleting WAL
+        // segments after flush (a Phase 8b optimisation) means the SSTable
+        // file headers are the authoritative source for what seqnos
+        // already exist on disk.
+        let mut max_seen_seqno = 0u64;
         for n in sst_sorted {
             let path = sst_path(&dir, n);
             let file = vfs.open_readonly(&path)?;
+            let reader = open_sst_reader(file, n, config.master_key.as_ref())?;
+            max_seen_seqno = max_seen_seqno.max(reader.file_header().max_seqno.get());
             sstables.push(LiveSst {
                 id: n,
-                reader: Arc::new(SstReader::open(file)?),
+                reader: Arc::new(reader),
             });
         }
 
         let memtable = Arc::new(SkipList::new());
 
-        // Replay WAL into the active memtable. We also track the maximum
-        // observed seqno so the engine resumes from the right place.
-        let mut max_seen_seqno = 0u64;
+        // Replay WAL into the active memtable. Any seqno greater than what
+        // the SSTables already carry advances `max_seen_seqno` further.
         for &seg in &wal_segments {
             let path = wal_segment_path(&dir, seg);
             let file = vfs.open_readonly(&path)?;
@@ -331,8 +375,8 @@ impl<V: Vfs> Db<V> {
         }
 
         // 2. Immutable memtables (newest first).
-        for mem in &state.immutable_memtables {
-            if let Some(node) = mem.get(key, snapshot.seqno) {
+        for im in &state.immutable_memtables {
+            if let Some(node) = im.memtable.get(key, snapshot.seqno) {
                 return Ok(match node.op_type() {
                     OpType::Put => Some(node.value().to_vec()),
                     OpType::Tombstone => None,
@@ -374,12 +418,12 @@ impl<V: Vfs> Db<V> {
             // Peek at the oldest immutable; flush if any.
             let to_flush = {
                 let state = self.state.load();
-                state.immutable_memtables.last().map(Arc::clone)
+                state.immutable_memtables.last().cloned()
             };
-            let Some(mem) = to_flush else {
+            let Some(im) = to_flush else {
                 break;
             };
-            self.flush_one(&mem)?;
+            self.flush_one(&im)?;
         }
         Ok(())
     }
@@ -425,6 +469,17 @@ impl<V: Vfs> Db<V> {
         let input_readers: Vec<Arc<SstReader<V::File>>> =
             inputs.iter().map(|l| Arc::clone(&l.reader)).collect();
 
+        // If encryption is enabled, the merged output needs its own
+        // per-SSTable key derived from `output_id`. The input keys are
+        // already wired up at open time (the readers above were opened via
+        // `open_sst_reader`), so the merger transparently sees plaintext.
+        let derived_output_key = self
+            .config
+            .master_key
+            .as_ref()
+            .map(|m| derive_sstable_key(m, output_id));
+        let encryption_param = derived_output_key.as_ref().map(|k| (k, output_id));
+
         let output = compact_sstables(
             &self.vfs,
             &input_readers,
@@ -433,6 +488,7 @@ impl<V: Vfs> Db<V> {
                 bloom: self.config.bloom_params(),
                 bloom_capacity_floor: self.config.sstable_capacity_hint,
                 checksum: Algorithm::Crc32c,
+                encryption: encryption_param,
             },
         )?;
 
@@ -522,14 +578,19 @@ impl<V: Vfs> Db<V> {
 
     fn rotate_memtable_locked(&self, ctx: &mut WriterCtx<V>) -> Result<()> {
         // Build new EngineState moving the active memtable into the
-        // immutable queue and seating a fresh active.
+        // immutable queue (paired with the WAL segment that fed it) and
+        // seating a fresh active.
         let new_active = Arc::new(SkipList::new());
+        let outgoing_wal_id = ctx.wal_segment_id;
         let new_state = {
             let prev = self.state.load_full();
             let mut immutables = Vec::with_capacity(prev.immutable_memtables.len() + 1);
             // Newest immutable goes to the *front* so iteration order
             // (newest-first) is preserved.
-            immutables.push(Arc::clone(&prev.active_memtable));
+            immutables.push(ImmutableMemtable {
+                memtable: Arc::clone(&prev.active_memtable),
+                wal_segment_id: outgoing_wal_id,
+            });
             immutables.extend(prev.immutable_memtables.iter().cloned());
             Arc::new(EngineState::<V> {
                 active_memtable: new_active,
@@ -556,9 +617,12 @@ impl<V: Vfs> Db<V> {
     }
 
     /// Flush exactly one immutable memtable to a new SSTable. Pops it off
-    /// the engine state (oldest, by convention) and registers the SSTable
-    /// at the front of the `sstables` list.
-    fn flush_one(&self, mem: &Arc<SkipList>) -> Result<()> {
+    /// the engine state (oldest, by convention), registers the SSTable
+    /// at the front of the `sstables` list, and unlinks the WAL segment
+    /// that fed the memtable — the SSTable is now durable so the WAL is
+    /// redundant.
+    fn flush_one(&self, im: &ImmutableMemtable) -> Result<()> {
+        let mem = &im.memtable;
         // Pick a file number under the write lock. We don't need to hold
         // the lock during the SSTable write — the file is private until we
         // publish it into EngineState.
@@ -571,12 +635,25 @@ impl<V: Vfs> Db<V> {
         let path = sst_path(&self.data_dir, file_number);
         let file = self.vfs.open_writable(&path)?;
         let key_count = mem.len();
-        let mut w = SstWriter::create_with_filter_capacity(
-            file,
-            Algorithm::Crc32c,
-            key_count.max(1),
-            self.config.bloom_params(),
-        )?;
+        let mut w = match self.config.master_key.as_ref() {
+            Some(master) => {
+                let key = derive_sstable_key(master, file_number);
+                SstWriter::create_encrypted(
+                    file,
+                    Algorithm::Crc32c,
+                    key_count.max(1),
+                    self.config.bloom_params(),
+                    &key,
+                    file_number,
+                )?
+            }
+            None => SstWriter::create_with_filter_capacity(
+                file,
+                Algorithm::Crc32c,
+                key_count.max(1),
+                self.config.bloom_params(),
+            )?,
+        };
 
         // The memtable iterator is already in ascending `(key, !seqno)`
         // order — exactly what `SstWriter::add` requires.
@@ -590,7 +667,11 @@ impl<V: Vfs> Db<V> {
         let _file = w.finish()?;
 
         // Open the SSTable read-side and publish it.
-        let reader = SstReader::open(self.vfs.open_readonly(&path)?)?;
+        let reader = open_sst_reader(
+            self.vfs.open_readonly(&path)?,
+            file_number,
+            self.config.master_key.as_ref(),
+        )?;
         let new_state = {
             let prev = self.state.load_full();
             let mut sstables = Vec::with_capacity(prev.sstables.len() + 1);
@@ -599,13 +680,13 @@ impl<V: Vfs> Db<V> {
                 reader: Arc::new(reader),
             });
             sstables.extend(prev.sstables.iter().cloned());
-            // Drop the just-flushed memtable from the immutable queue.
-            // We match by Arc identity to be robust to multiple concurrent
-            // flush calls (none expected today, but safe).
+            // Drop the just-flushed memtable from the immutable queue by
+            // matching the wal_segment_id (each immutable has its own
+            // distinct id, so this is a unique key).
             let immutables: Vec<_> = prev
                 .immutable_memtables
                 .iter()
-                .filter(|m| !Arc::ptr_eq(m, mem))
+                .filter(|m| m.wal_segment_id != im.wal_segment_id)
                 .cloned()
                 .collect();
             Arc::new(EngineState::<V> {
@@ -615,6 +696,15 @@ impl<V: Vfs> Db<V> {
             })
         };
         self.state.store(new_state);
+
+        // The WAL segment that fed this memtable is now redundant — the
+        // SSTable carries every record durably. Best-effort unlink; a
+        // missing file is fine (idempotent).
+        if im.wal_segment_id != 0 {
+            let wal_path = wal_segment_path(&self.data_dir, im.wal_segment_id);
+            let _ = self.vfs.remove(&wal_path);
+        }
+
         Ok(())
     }
 }
@@ -633,6 +723,24 @@ impl<V: Vfs> std::fmt::Debug for Db<V> {
 }
 
 // ----- helpers -----
+
+/// Open an SSTable file, picking the encrypted or plaintext path based on
+/// whether a master key is present. The `sstable_id` is used in the key
+/// derivation; it must match the file id under which the SSTable was
+/// originally written.
+fn open_sst_reader<F: crate::io::vfs::VfsFile>(
+    file: F,
+    sstable_id: u64,
+    master_key: Option<&MasterKey>,
+) -> Result<SstReader<F>> {
+    match master_key {
+        Some(master) => {
+            let key = derive_sstable_key(master, sstable_id);
+            SstReader::open_encrypted(file, &key, sstable_id)
+        }
+        None => SstReader::open(file),
+    }
+}
 
 fn apply_batch_to_memtable(memtable: &SkipList, seqno: u64, batch: &WriteBatch) {
     for op in batch.ops() {

@@ -8,6 +8,8 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use paddock_core::Db;
+use paddock_core::crypto::MasterKey;
+use paddock_core::engine::DbConfig;
 use paddock_core::io::vfs::MemVfs;
 use paddock_core::wal::batch::WriteBatch;
 
@@ -210,6 +212,113 @@ fn compact_all_survives_subsequent_reopen() {
             assert_eq!(db.get(k.as_bytes()).unwrap(), Some(b"v".to_vec()));
         }
     }
+}
+
+fn open_encrypted(vfs: MemVfs, master: [u8; 32]) -> Db<MemVfs> {
+    let cfg = DbConfig {
+        master_key: Some(MasterKey::from_bytes(master)),
+        ..DbConfig::default()
+    };
+    Db::open_with(vfs, "/db", cfg).expect("open encrypted")
+}
+
+#[test]
+fn encrypted_round_trip_after_flush() {
+    let vfs = MemVfs::new();
+    let db = open_encrypted(vfs, [0xAB; 32]);
+    for i in 0..50u32 {
+        db.put(
+            format!("k-{i:03}").as_bytes(),
+            format!("v-{i:03}").as_bytes(),
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0..50u32 {
+        assert_eq!(
+            db.get(format!("k-{i:03}").as_bytes()).unwrap(),
+            Some(format!("v-{i:03}").into_bytes())
+        );
+    }
+}
+
+#[test]
+fn encrypted_compaction_preserves_data() {
+    let vfs = MemVfs::new();
+    let db = open_encrypted(vfs, [0xCC; 32]);
+    for chunk in 0..3u32 {
+        for i in 0..30u32 {
+            db.put(format!("k-{chunk}-{i:03}").as_bytes(), b"v")
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(db.sstable_count(), 3);
+    db.compact_all().unwrap();
+    assert_eq!(db.sstable_count(), 1);
+    for chunk in 0..3u32 {
+        for i in 0..30u32 {
+            assert_eq!(
+                db.get(format!("k-{chunk}-{i:03}").as_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
+    }
+}
+
+#[test]
+fn encrypted_data_persists_across_reopen() {
+    let vfs = MemVfs::new();
+    let master = [0x77; 32];
+    {
+        let db = open_encrypted(vfs.clone(), master);
+        for i in 0..40u32 {
+            db.put(format!("k-{i:03}").as_bytes(), b"persisted")
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let db2 = open_encrypted(vfs, master);
+    for i in 0..40u32 {
+        assert_eq!(
+            db2.get(format!("k-{i:03}").as_bytes()).unwrap(),
+            Some(b"persisted".to_vec())
+        );
+    }
+}
+
+#[test]
+fn opening_encrypted_db_without_key_fails() {
+    let vfs = MemVfs::new();
+    {
+        let db = open_encrypted(vfs.clone(), [0xDE; 32]);
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+    }
+    // No master key -> reader refuses encrypted file.
+    let err = Db::open(vfs, "/db").expect_err("must fail without key");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("encrypted") || msg.contains("InvalidFormat") || msg.contains("invalid"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn opening_with_wrong_master_key_yields_auth_failure() {
+    let vfs = MemVfs::new();
+    {
+        let db = open_encrypted(vfs.clone(), [0xAA; 32]);
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+    }
+    // Open with a different master key. Recovery succeeds (WAL is in the
+    // clear in Phase 8b — only SSTable data blocks are encrypted), but
+    // the read path will trip the AEAD tag mismatch when it tries to
+    // touch the SSTable's data block.
+    let db = open_encrypted(vfs, [0xBB; 32]);
+    let res = db.get(b"k");
+    assert!(res.is_err(), "expected AEAD failure, got {res:?}");
 }
 
 #[test]

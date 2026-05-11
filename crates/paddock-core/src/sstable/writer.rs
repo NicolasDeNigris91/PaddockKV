@@ -30,6 +30,8 @@
 use zerocopy::IntoBytes;
 
 use crate::checksum::Algorithm;
+use crate::crypto::aead::{Aead, AeadKey, TAG_LEN};
+use crate::crypto::envelope::{block_aad, derive_block_nonce};
 use crate::error::Result;
 use crate::filter::{BlockedBloom, BloomParams};
 use crate::io::vfs::VfsFile;
@@ -38,6 +40,22 @@ use crate::sstable::format::{
     BLOCK_ALIGNMENT, BLOCK_HANDLE_SIZE, BlockHandle, CompressionAlg, DEFAULT_BLOCK_SIZE,
     FILE_HEADER_REGION_SIZE, FOOTER_SIZE, FileHeader, Footer, RecordOp, flag,
 };
+
+/// Per-SSTable encryption state. When [`SstWriter`] holds `Some`, every
+/// data block is encrypted in place before it is written; the on-disk
+/// block bytes are the AEAD ciphertext (plaintext bytes + 16-byte tag).
+pub(crate) struct EncryptionCtx {
+    pub(crate) aead: Aead,
+    pub(crate) sstable_id: u64,
+}
+
+impl std::fmt::Debug for EncryptionCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionCtx")
+            .field("sstable_id", &self.sstable_id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Build a complete SSTable by streaming sorted records through [`add`](Self::add).
 pub struct SstWriter<F: VfsFile> {
@@ -62,6 +80,8 @@ pub struct SstWriter<F: VfsFile> {
     /// construction (`new_with_filter_capacity`); the default `create`
     /// sizes it for 10K keys and re-sizes lazily if it overshoots.
     bloom: Option<BlockedBloom>,
+    /// Per-block AES-256-GCM context. `None` for plaintext SSTables.
+    crypto: Option<EncryptionCtx>,
 }
 
 impl<F: VfsFile> SstWriter<F> {
@@ -80,13 +100,49 @@ impl<F: VfsFile> SstWriter<F> {
     /// entirely — useful when the engine knows it will never lookup into
     /// this table (e.g. a write-only sink).
     pub fn create_with_filter_capacity(
-        mut file: F,
+        file: F,
         checksum_alg: Algorithm,
         expected_keys: usize,
         params: BloomParams,
     ) -> Result<Self> {
-        // Reserve the file-header region with zeros. We'll back-fill the real
-        // header inside [`finish`].
+        Self::create_inner(file, checksum_alg, expected_keys, params, None)
+    }
+
+    /// Construct an **encrypted** writer.
+    ///
+    /// Every data block this writer emits is wrapped in AES-256-GCM with a
+    /// nonce derived from the block's file offset and AAD that binds the
+    /// ciphertext to `(sstable_id, block_offset)`. Filter, meta, and index
+    /// blocks are left in the clear — they leak metadata only and never
+    /// carry plaintext values; see `docs/THREAT_MODEL.md`.
+    ///
+    /// The `aead_key` is typically the output of
+    /// [`crate::crypto::kdf::derive_sstable_key`] applied to the engine's
+    /// master key and this SSTable's file id.
+    pub fn create_encrypted(
+        file: F,
+        checksum_alg: Algorithm,
+        expected_keys: usize,
+        params: BloomParams,
+        aead_key: &AeadKey,
+        sstable_id: u64,
+    ) -> Result<Self> {
+        let ctx = EncryptionCtx {
+            aead: Aead::new(aead_key),
+            sstable_id,
+        };
+        Self::create_inner(file, checksum_alg, expected_keys, params, Some(ctx))
+    }
+
+    fn create_inner(
+        mut file: F,
+        checksum_alg: Algorithm,
+        expected_keys: usize,
+        params: BloomParams,
+        crypto: Option<EncryptionCtx>,
+    ) -> Result<Self> {
+        // Reserve the file-header region with zeros. We back-fill the real
+        // header inside `finish()` via `VfsFile::write_at`.
         let pad = vec![0u8; FILE_HEADER_REGION_SIZE];
         file.append(&pad)?;
         let bloom = if expected_keys == 0 {
@@ -107,6 +163,7 @@ impl<F: VfsFile> SstWriter<F> {
             checksum_alg,
             block_size: DEFAULT_BLOCK_SIZE,
             bloom,
+            crypto,
         })
     }
 
@@ -165,15 +222,38 @@ impl<F: VfsFile> SstWriter<F> {
 
     /// Append `bytes` as a single block and pad up to the next [`BLOCK_ALIGNMENT`].
     /// Returns the [`BlockHandle`] for the block.
-    fn write_block(&mut self, bytes: &[u8]) -> Result<BlockHandle> {
+    ///
+    /// When encryption is active the on-disk bytes are the AEAD ciphertext
+    /// (plaintext + 16-byte tag); the `checksum` field of the handle is
+    /// zero because the AEAD tag is the integrity check. When encryption
+    /// is off the bytes are written verbatim and the handle records the
+    /// block's intrinsic CRC32C.
+    fn write_block(&mut self, plaintext: &[u8]) -> Result<BlockHandle> {
         let offset = self.bytes_written;
-        self.file.append(bytes)?;
-        self.bytes_written += bytes.len() as u64;
-        // Block checksum is the last 4 bytes of the block bytes (CRC32C).
-        // Surface it on the handle so the reader can sanity-check.
-        let checksum =
-            u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().expect("4-byte slice"));
-        let length = u32::try_from(bytes.len()).expect("block length always fits in u32");
+        let (on_disk, checksum) = if let Some(ctx) = &self.crypto {
+            let nonce = derive_block_nonce(offset);
+            let aad = block_aad(ctx.sstable_id, offset);
+            let ct = ctx
+                .aead
+                .seal(nonce.as_nonce(), &aad, plaintext)
+                .map_err(|_| {
+                    crate::error::Error::corruption_static("sstable writer", "AEAD seal failed")
+                })?;
+            debug_assert_eq!(ct.len(), plaintext.len() + TAG_LEN);
+            (ct, 0u32)
+        } else {
+            // Block checksum is the last 4 bytes (CRC32C) — surface it on
+            // the handle so the reader can sanity-check before parsing.
+            let crc = u32::from_le_bytes(
+                plaintext[plaintext.len() - 4..]
+                    .try_into()
+                    .expect("4-byte slice"),
+            );
+            (plaintext.to_vec(), crc)
+        };
+        self.file.append(&on_disk)?;
+        self.bytes_written += on_disk.len() as u64;
+        let length = u32::try_from(on_disk.len()).expect("block length always fits in u32");
         let handle = BlockHandle {
             offset: zerocopy::little_endian::U64::new(offset),
             length: zerocopy::little_endian::U32::new(length),
@@ -210,10 +290,11 @@ impl<F: VfsFile> SstWriter<F> {
     }
 
     /// Seal the SSTable: flush any open data block, write filter/meta/index
-    /// blocks, then back-fill the file header and append the footer.
+    /// blocks, back-fill the file header at offset 0, then append the footer.
     pub fn finish(mut self) -> Result<F> {
         self.flush_block()?;
         let data_blocks_end_offset = self.bytes_written;
+        let encrypted = self.crypto.is_some();
 
         // Filter block: persist the Bloom filter we accumulated as keys
         // arrived. Zero-length handle when filter is disabled.
@@ -267,27 +348,17 @@ impl<F: VfsFile> SstWriter<F> {
         self.file.append(footer.as_bytes())?;
         self.bytes_written += FOOTER_SIZE as u64;
 
-        // Back-fill the file header. MemFile and DirectFile both support
-        // append-only writes; for the back-fill we rely on the VFS allowing
-        // us to write at offset 0. MemVfs has no positional-write API, so
-        // we emit the header bytes here and let the caller materialise them
-        // via a separate path. For Phase 4 we simply append the header at
-        // the *end*, sentinel-style: real positional back-fill is added in
-        // Phase 6 when DirectFile gains pwrite-from-buffer-pool.
-        //
-        // Because the file-header region is zeroed at the front and re-emitted
-        // here, the reader knows where to find the canonical header by
-        // reading the footer first (it carries the data_blocks_end_offset
-        // implicitly via the index handle's offset; the file header itself
-        // can be back-filled by `SstReader::open` when this hack lands in a
-        // later phase).
-        //
-        // For now we encode the header right before the footer too, and the
-        // reader looks for the magic at the start of the file — if it sees
-        // zeros there, it reads the trailer-side copy. This keeps tests
-        // deterministic without requiring a pwrite API.
+        // Back-fill the canonical file header at offset 0. The 4 KiB
+        // header region was reserved (zeros) at construction; we now
+        // overwrite the leading bytes with the real FileHeader. The
+        // remaining zeros pad to the page boundary so the first data
+        // block stays page-aligned for future O_DIRECT reads.
+        let mut flags = flag::CHECKSUMMED;
+        if encrypted {
+            flags |= flag::ENCRYPTED;
+        }
         let header = FileHeader::new_signed(
-            flag::CHECKSUMMED,
+            flags,
             CompressionAlg::None,
             self.checksum_alg,
             self.num_entries,
@@ -300,15 +371,7 @@ impl<F: VfsFile> SstWriter<F> {
             self.max_seqno,
             data_blocks_end_offset,
         );
-        // The reserved 4 KiB at the front of the file is already zero. We
-        // write the canonical header bytes to the front by re-opening the
-        // VFS file in append mode is not feasible; instead callers wanting
-        // an exactly-correct front header use the writer's
-        // [`finalise_with_header`] method that callers can layer on top
-        // when their VFS supports pwrite. For now, [`SstReader::open`]
-        // accepts a file whose front-header region is zero by reading the
-        // trailing copy emitted just before the footer.
-        let _ = header; // header bytes will be back-filled in Phase 6
+        self.file.write_at(header.as_bytes(), 0)?;
         Ok(self.file)
     }
 }

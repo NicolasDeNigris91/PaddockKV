@@ -65,7 +65,7 @@ See [`docs/THREAT_MODEL.md`](THREAT_MODEL.md). Protects offline disks. Does
 | 7 | Compaction (k-way merge, `Db::compact_all`) | ✅ done |
 | 7b | Snapshot-aware version pruning + manifest | ⏳ |
 | 8a | Crypto primitives (AES-256-GCM, HKDF-SHA256, envelope) | ✅ done |
-| 8b | SSTable encryption pipeline integration | ⏳ |
+| 8b | SSTable encryption pipeline (per-block AEAD, file-header back-fill, WAL post-flush cleanup) | ✅ done |
 | 9 | Fuzzing + sanitizers | ⏳ |
 | 10 | Benchmarks + docs | ⏳ |
 

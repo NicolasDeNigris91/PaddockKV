@@ -50,6 +50,14 @@ pub const RESTART_INTERVAL: usize = 16;
 pub mod flag {
     /// Block payloads carry an end-of-block CRC32C / XXH3 checksum.
     pub const CHECKSUMMED: u32 = 1 << 0;
+    /// Data block payloads are encrypted with AES-256-GCM.
+    ///
+    /// Filter, index, and meta blocks remain plaintext — see
+    /// `docs/THREAT_MODEL.md` for the metadata-leakage discussion. When
+    /// this flag is set, readers must derive the per-SSTable key via
+    /// [`crate::crypto::kdf::derive_sstable_key`] from the operator's
+    /// master key and the SSTable's file id.
+    pub const ENCRYPTED: u32 = 1 << 1;
 }
 
 /// Tag for the compression algorithm applied to data blocks. Phase 4 emits
