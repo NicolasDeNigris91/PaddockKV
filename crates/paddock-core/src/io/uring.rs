@@ -110,15 +110,14 @@ impl Uring {
 
     /// Number of SQEs currently sitting in the submission queue (not yet
     /// submitted to the kernel).
-    #[must_use]
-    pub fn pending_submissions(&self) -> usize {
+    pub fn pending_submissions(&mut self) -> usize {
         self.inner.submission().len()
     }
 
     /// Free capacity in the submission queue.
-    #[must_use]
-    pub fn submission_capacity(&self) -> usize {
-        self.inner.submission().capacity() - self.inner.submission().len()
+    pub fn submission_capacity(&mut self) -> usize {
+        let sq = self.inner.submission();
+        sq.capacity() - sq.len()
     }
 
     /// Push a write SQE.
@@ -139,7 +138,8 @@ impl Uring {
         offset: u64,
         user_data: UserData,
     ) -> Result<()> {
-        let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+        let len = u32::try_from(buf.len()).map_err(|_| buf_too_large())?;
+        let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), len)
             .offset(offset)
             .build()
             .user_data(user_data);
@@ -167,7 +167,8 @@ impl Uring {
         offset: u64,
         user_data: UserData,
     ) -> Result<()> {
-        let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+        let len = u32::try_from(buf.len()).map_err(|_| buf_too_large())?;
+        let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len)
             .offset(offset)
             .build()
             .user_data(user_data);
@@ -214,7 +215,8 @@ impl Uring {
         write_tag: UserData,
         fsync_tag: UserData,
     ) -> Result<()> {
-        let write = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+        let len = u32::try_from(buf.len()).map_err(|_| buf_too_large())?;
+        let write = opcode::Write::new(types::Fd(fd), buf.as_ptr(), len)
             .offset(offset)
             .build()
             .flags(io_uring::squeue::Flags::IO_LINK)
@@ -223,14 +225,19 @@ impl Uring {
             .flags(types::FsyncFlags::DATASYNC)
             .build()
             .user_data(fsync_tag);
-        // SAFETY: see `push_write`; both SQEs are pushed together so they will
-        // either both submit or both fail.
+        let mut sq = self.inner.submission();
+        if sq.capacity() - sq.len() < 2 {
+            return Err(sq_full());
+        }
+        // SAFETY: `buf` is borrowed for the inflight duration per `push_write`'s
+        // contract; the SQE only captures pointer/length, not a Rust reference.
         unsafe {
-            let mut sq = self.inner.submission();
-            if sq.capacity() - sq.len() < 2 {
-                return Err(sq_full());
-            }
             sq.push(&write).map_err(|_| sq_full())?;
+        }
+        // SAFETY: the `Fsync` op takes no user buffer, so no buffer lifetime
+        // applies. The IO_LINK flag on the write makes the kernel order this
+        // strictly after the preceding write completes successfully.
+        unsafe {
             sq.push(&fsync).map_err(|_| sq_full())?;
         }
         Ok(())
@@ -299,7 +306,7 @@ impl Uring {
 
     /// Borrow the underlying ring for advanced operations not exposed here.
     #[must_use]
-    pub fn inner_mut(&mut self) -> &mut IoUring {
+    pub const fn inner_mut(&mut self) -> &mut IoUring {
         &mut self.inner
     }
 }
@@ -326,6 +333,14 @@ fn sq_full() -> crate::error::Error {
     ))
 }
 
+#[inline]
+fn buf_too_large() -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "io_uring SQE length exceeds u32::MAX",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
@@ -346,7 +361,7 @@ mod tests {
             Err(crate::error::Error::Io(e))
                 if matches!(
                     e.raw_os_error(),
-                    Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)
+                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
                 ) =>
             {
                 eprintln!("skipping io_uring test: {e}");
@@ -358,7 +373,7 @@ mod tests {
 
     #[test]
     fn new_constructs_a_ring() {
-        let Some(ring) = ring_or_skip() else {
+        let Some(mut ring) = ring_or_skip() else {
             return;
         };
         assert_eq!(ring.pending_submissions(), 0);
@@ -370,7 +385,7 @@ mod tests {
             return;
         };
         let path = temp_path("write");
-        let mut f = OpenOptions::new()
+        let f = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
@@ -380,9 +395,9 @@ mod tests {
         // Seed the file with a known size so reads/writes work without O_APPEND.
         f.set_len(0).unwrap();
 
+        let buf = AlignedBuf::new(4096).unwrap();
         // SAFETY: `buf` is borrowed for the duration of the inflight write
         // (we wait synchronously below).
-        let buf = AlignedBuf::new(4096).unwrap();
         unsafe {
             ring.push_write(f.as_raw_fd(), buf.as_slice(), 0, 0x42)
                 .unwrap();
