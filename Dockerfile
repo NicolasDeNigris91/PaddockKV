@@ -34,19 +34,23 @@ RUN cargo build --release -p paddock-server
 
 # -- Stage 4: runtime --
 FROM debian:bookworm-slim AS runtime
+# `gosu` lets the entrypoint chown the mounted volume as root, then drop
+# to the unprivileged `paddock` user before exec'ing the server. CA bundle
+# is kept for future KMS / remote-key fetch use cases.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin paddock \
     && mkdir -p /data \
     && chown paddock:paddock /data
-USER paddock
-WORKDIR /home/paddock
 COPY --from=builder /work/target/release/paddock-server /usr/local/bin/paddock-server
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV DATA_DIR=/data \
     RUST_LOG=info,paddock_server=debug,tower_http=info
 EXPOSE 8080
 # Railway / Fly / Render run their own health probes via HTTP against
 # `/health`, so we don't bake a HEALTHCHECK directive — those platforms
 # call straight into the route.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/usr/local/bin/paddock-server"]
