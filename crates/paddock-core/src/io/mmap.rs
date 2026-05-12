@@ -73,6 +73,8 @@ pub struct Mmap {
 // independently of which thread accesses the bytes. Concurrent `&[u8]` reads
 // from multiple threads are well-defined.
 unsafe impl Send for Mmap {}
+// SAFETY: same rationale as `Send` — the mapping is read-only, so concurrent
+// shared access from multiple threads is well-defined.
 unsafe impl Sync for Mmap {}
 
 impl Mmap {
@@ -120,8 +122,7 @@ impl Mmap {
             return Err(io::Error::last_os_error().into());
         }
         let ptr = NonNull::new(addr.cast::<libc::c_void>()).ok_or_else(|| {
-            crate::error::Error::Io(io::Error::new(
-                io::ErrorKind::Other,
+            crate::error::Error::Io(io::Error::other(
                 "mmap returned null without setting MAP_FAILED",
             ))
         })?;
@@ -131,7 +132,7 @@ impl Mmap {
     /// Borrow the mapping as a byte slice.
     #[inline]
     #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
+    pub const fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` came from a successful `mmap` of `len` bytes for
         // `PROT_READ`. The kernel keeps the mapping valid until we `munmap`
         // in `Drop`. The slice borrows `&self`, so it cannot outlive the

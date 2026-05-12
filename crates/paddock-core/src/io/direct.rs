@@ -41,26 +41,23 @@ pub struct DirectFile {
 impl DirectFile {
     /// Open `path` with `O_DIRECT | O_RDWR`, creating it if missing.
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_options(
-            path,
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .custom_flags(libc::O_DIRECT),
-        )
+        let mut opts = OpenOptions::new();
+        opts.read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_DIRECT);
+        Self::open_with_options(path, &opts)
     }
 
     /// Open `path` for read-only access with `O_DIRECT`.
     pub fn open_read<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_options(
-            path,
-            OpenOptions::new().read(true).custom_flags(libc::O_DIRECT),
-        )
+        let mut opts = OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_DIRECT);
+        Self::open_with_options(path, &opts)
     }
 
-    fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Self> {
+    fn open_with_options<P: AsRef<Path>>(path: P, opts: &OpenOptions) -> Result<Self> {
         let file = opts.open(path)?;
         Ok(Self {
             file,
@@ -87,7 +84,7 @@ impl DirectFile {
     /// direct fd) and for syscalls not directly exposed here.
     #[inline]
     #[must_use]
-    pub fn as_file(&self) -> &File {
+    pub const fn as_file(&self) -> &File {
         &self.file
     }
 
@@ -128,7 +125,7 @@ impl DirectFile {
                     self.as_raw_fd(),
                     remaining.as_ptr().cast::<libc::c_void>(),
                     remaining.len(),
-                    off as libc::off_t,
+                    off.cast_signed(),
                 )
             };
             if n < 0 {
@@ -166,7 +163,7 @@ impl DirectFile {
                     self.as_raw_fd(),
                     remaining.as_mut_ptr().cast::<libc::c_void>(),
                     remaining.len(),
-                    off as libc::off_t,
+                    off.cast_signed(),
                 )
             };
             if n < 0 {
@@ -193,7 +190,7 @@ impl DirectFile {
         // SAFETY: `fallocate` is a standard syscall. `fd` is owned by `self`;
         // `mode=0` is the default "allocate" mode; `offset=0`, `len=len` are
         // valid (the kernel rejects negative or overflowing lengths).
-        let rc = unsafe { libc::fallocate(self.as_raw_fd(), 0, 0, len as libc::off_t) };
+        let rc = unsafe { libc::fallocate(self.as_raw_fd(), 0, 0, len.cast_signed()) };
         if rc == 0 {
             Ok(())
         } else {
@@ -215,14 +212,14 @@ impl DirectFile {
 
     fn check_alignment(&self, len: usize, offset: u64) -> Result<()> {
         let bs = self.block_size;
-        if len % bs != 0 {
+        if !len.is_multiple_of(bs) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("buffer length {len} not a multiple of block size {bs}"),
             )
             .into());
         }
-        if offset % (bs as u64) != 0 {
+        if !offset.is_multiple_of(bs as u64) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("offset {offset} not aligned to block size {bs}"),

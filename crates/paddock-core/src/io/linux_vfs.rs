@@ -111,10 +111,11 @@ impl Vfs for LinuxVfs {
 
     fn open_writable(&self, path: &str) -> Result<Self::File> {
         let full = self.resolve(path)?;
-        if let Some(parent) = full.parent() {
-            if !parent.as_os_str().is_empty() && parent != self.root {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = full.parent()
+            && !parent.as_os_str().is_empty()
+            && parent != self.root
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new()
             .read(true)
@@ -193,7 +194,7 @@ impl std::fmt::Debug for LinuxFile {
 
 impl VfsFile for LinuxFile {
     fn append(&mut self, data: &[u8]) -> Result<u64> {
-        let mut guard = self.inner.lock().expect("LinuxFile lock poisoned");
+        let guard = self.inner.lock().expect("LinuxFile lock poisoned");
         let offset = guard.metadata()?.len();
         // `write_all_at` is the positional, no-seek version. Avoids the
         // `seek(End) + write_all` race where a concurrent append on
@@ -273,7 +274,7 @@ mod tests {
         let root = temp_root("write-at");
         let vfs = LinuxVfs::new(&root);
         let mut f = vfs.open_writable("overlay").unwrap();
-        f.append(&vec![0u8; 32]).unwrap();
+        f.append(&[0u8; 32]).unwrap();
         f.write_at(b"BACKFILL", 4).unwrap();
         f.sync().unwrap();
 
