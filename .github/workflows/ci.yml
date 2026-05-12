@@ -109,15 +109,20 @@ jobs:
       # campaigns run out-of-band on a dedicated host; CI's job is to
       # catch crashes that any 30-second run would find — i.e. immediate
       # panics on the empty / one-byte / two-byte / etc. inputs.
+      #
+      # `--fuzz-dir .` overrides cargo-fuzz's default of looking for a
+      # `fuzz/` subdirectory; this project keeps the fuzz crate at
+      # `crates/paddock-fuzz/` and treats that directory itself as the
+      # fuzz root.
       - name: WAL recovery
         working-directory: crates/paddock-fuzz
-        run: cargo +nightly fuzz run fuzz_wal_recovery -- -max_total_time=30
+        run: cargo +nightly fuzz run --fuzz-dir . fuzz_wal_recovery -- -max_total_time=30
       - name: SSTable parse
         working-directory: crates/paddock-fuzz
-        run: cargo +nightly fuzz run fuzz_sstable_parse -- -max_total_time=30
+        run: cargo +nightly fuzz run --fuzz-dir . fuzz_sstable_parse -- -max_total_time=30
       - name: Bloom decode
         working-directory: crates/paddock-fuzz
-        run: cargo +nightly fuzz run fuzz_bloom_decode -- -max_total_time=30
+        run: cargo +nightly fuzz run --fuzz-dir . fuzz_bloom_decode -- -max_total_time=30
       - name: WriteBatch decode
         working-directory: crates/paddock-fuzz
-        run: cargo +nightly fuzz run fuzz_writebatch_decode -- -max_total_time=30
+        run: cargo +nightly fuzz run --fuzz-dir . fuzz_writebatch_decode -- -max_total_time=30
