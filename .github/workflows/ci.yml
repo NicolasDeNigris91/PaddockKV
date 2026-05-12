@@ -58,10 +58,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: Install miri
-        run: rustup component add miri --toolchain $(cat rust-toolchain.toml | grep channel | cut -d'"' -f2)
-      - name: Setup miri
-        run: cargo miri setup
+      # Miri only ships on nightly — it is not built for stable channels, so
+      # we install a separate nightly toolchain alongside the stable pinned
+      # in `rust-toolchain.toml` and invoke miri via `cargo +nightly miri`.
+      - name: Install nightly toolchain with miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          cargo +nightly miri setup
       # Miri specifically targets the unsafe-heavy modules:
       #   - `io::aligned_buf` (manual allocator + raw pointer math)
       #   - `memtable::arena`  (bump allocator + slab list)
@@ -73,10 +76,10 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
         run: |
-          cargo miri test -p paddock-core --lib io::aligned_buf -- --skip prop_
-          cargo miri test -p paddock-core --lib memtable::arena -- --skip prop_
-          cargo miri test -p paddock-core --lib memtable::skiplist -- --skip prop_ --skip multi_threaded_reads_during_single_writer_inserts
-          cargo miri test -p paddock-core --lib filter::blocked_bloom -- --skip prop_ --skip scalar_and_avx2_agree
+          cargo +nightly miri test -p paddock-core --lib io::aligned_buf -- --skip prop_
+          cargo +nightly miri test -p paddock-core --lib memtable::arena -- --skip prop_
+          cargo +nightly miri test -p paddock-core --lib memtable::skiplist -- --skip prop_ --skip multi_threaded_reads_during_single_writer_inserts
+          cargo +nightly miri test -p paddock-core --lib filter::blocked_bloom -- --skip prop_ --skip scalar_and_avx2_agree
 
   deny:
     name: cargo-deny
@@ -93,10 +96,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # cargo-fuzz the CLI builds on stable; only `cargo fuzz run` itself needs
+      # nightly (set via the `+nightly` toolchain selector below). We install
+      # without `--locked` so the resolver picks current dependency versions
+      # rather than the older lockfile shipped with cargo-fuzz, which pinned a
+      # `proc-macro-error` release that fails to compile on recent nightlies.
       - name: Install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
-          cargo +nightly install cargo-fuzz --locked
+          cargo install cargo-fuzz
       # Smoke-run every fuzz target for 30 seconds each. Real fuzzing
       # campaigns run out-of-band on a dedicated host; CI's job is to
       # catch crashes that any 30-second run would find — i.e. immediate

@@ -20,6 +20,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "ISC",
     "Unicode-DFS-2016",
     "Unicode-3.0",
@@ -31,6 +32,11 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are referenced as `{ workspace = true }`, which
+# resolves to a path dependency without a version. That is the canonical
+# pattern for non-published workspace members; we exempt path deps from the
+# wildcard ban so external `"*"` deps (which we don't want) are still caught.
+allow-wildcard-paths = true
 highlight = "all"
 deny = [
     # No high-level KV engines allowed.
